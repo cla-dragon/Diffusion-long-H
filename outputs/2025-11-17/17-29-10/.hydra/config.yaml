@@ -1,0 +1,50 @@
+pipeline_name: diffuser_test
+run_alias: basic_test
+mode: inference
+seed: 0
+device: cuda:1
+project: Diffusion_OG
+group: debug
+enable_wandb: true
+planner_solver: ddim
+planner_emb_dim: 128
+planner_d_model: 256
+planner_depth: 2
+planner_sampling_steps: 20
+planner_predict_noise: true
+planner_next_obs_loss_weight: 1
+planner_ema_rate: 0.9999
+unet_dim: 32
+policy_solver: ddpm
+policy_hidden_dim: 256
+policy_diffusion_steps: 10
+policy_sampling_steps: 10
+policy_predict_noise: true
+policy_ema_rate: 0.995
+policy_learning_rate: 0.0003
+critic_learning_rate: 0.0003
+use_diffusion_invdyn: 1
+invdyn_gradient_steps: 200000
+policy_diffusion_gradient_steps: 1000000
+planner_diffusion_gradient_steps: 1000000
+batch_size: 128
+log_interval: 1000
+save_interval: 100000
+num_envs: 1
+planner_num_candidates: 20
+planner_ckpt: 1000000
+critic_ckpt: 200000
+policy_ckpt: 1000000
+invdyn_ckpt: 200000
+planner_use_ema: true
+policy_temperature: 0.5
+policy_use_ema: true
+num_eval_episodes: 50
+num_video_episodes: 1
+video_frame_skip: 3
+task:
+  env_name: cube-single-play-v0
+  max_path_length: 1001
+  planner_horizon: 200
+  planner_temperature: 1.0
+  w_ldg: 0

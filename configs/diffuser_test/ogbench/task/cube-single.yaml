@@ -1,0 +1,6 @@
+env_name: "cube-single-play-v0"
+max_path_length: 1001
+
+planner_horizon: 150
+planner_temperature: 1.0
+w_ldg: 0

@@ -1,0 +1,85 @@
+pipeline_name: diffuser+gciql_test
+run_alias: basic_gciql_test
+mode: inference
+seed: 0
+device: cuda:2
+project: Diffusion_OG
+group: debug
+enable_wandb: true
+planner_solver: ddim
+planner_emb_dim: 128
+planner_d_model: 256
+planner_depth: 2
+planner_sampling_steps: 20
+planner_predict_noise: true
+planner_next_obs_loss_weight: 1
+planner_ema_rate: 0.9999
+unet_dim: 32
+policy_solver: ddpm
+policy_hidden_dim: 256
+policy_diffusion_steps: 10
+policy_sampling_steps: 10
+policy_predict_noise: true
+policy_ema_rate: 0.995
+policy_learning_rate: 0.0003
+critic_learning_rate: 0.0003
+use_diffusion_invdyn: 0
+invdyn_gradient_steps: 200000
+policy_diffusion_gradient_steps: 1000000
+planner_diffusion_gradient_steps: 1000000
+batch_size: 128
+log_interval: 1000
+save_interval: 100000
+num_envs: 1
+planner_num_candidates: 20
+planner_ckpt: 1000000
+critic_ckpt: 200000
+policy_ckpt: 1000000
+invdyn_ckpt: 200000
+planner_use_ema: true
+policy_temperature: 0.5
+policy_use_ema: true
+num_eval_episodes: 50
+num_video_episodes: 1
+video_frame_skip: 3
+task:
+  env_name: cube-single-play-v0
+  max_path_length: 1001
+  planner_horizon: 150
+  planner_temperature: 1.0
+  w_ldg: 0
+low_controller:
+  lr: 0.0003
+  actor_lr: null
+  critic_lr: null
+  value_lr: null
+  discount: 0.99
+  tau: 0.005
+  expectile: 0.9
+  alpha: 0.3
+  actor_loss: ddpgbc
+  actor_hidden_dims:
+  - 512
+  - 512
+  - 512
+  value_hidden_dims:
+  - 512
+  - 512
+  - 512
+  layer_norm: true
+  const_std: true
+  min_log_std: -5.0
+  max_log_std: 2.0
+  state_dependent_std: null
+  discrete: false
+  value_p_curgoal: 0.2
+  value_p_trajgoal: 0.5
+  value_p_randomgoal: 0.3
+  value_geom_sample: true
+  actor_p_curgoal: 0.0
+  actor_p_trajgoal: 1.0
+  actor_p_randomgoal: 0.0
+  actor_geom_sample: true
+  gc_negative: true
+  p_aug: 0.0
+  frame_stack: null

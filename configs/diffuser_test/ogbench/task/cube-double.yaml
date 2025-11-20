@@ -1,0 +1,6 @@
+env_name: "cube-double-play-v0"
+max_path_length: 1001
+
+planner_horizon: 400
+planner_temperature: 1.0
+w_ldg: 0
