@@ -128,7 +128,7 @@ class GoalConditionedActor(nn.Module):
         if self.state_dependent_std:
             self.log_std_head = nn.Linear(last_dim, action_dim)
         else:
-            self.log_std = nn.Parameter(torch.zeros(action_dim))
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=False)
 
     def forward(self, obs: Tensor, goal: Tensor, temperature: float = 1.0) -> Tuple[Independent, Tensor, Tensor]:
         x = torch.cat([obs, goal], dim=-1)
@@ -342,7 +342,6 @@ class GCIQLAgent:
             obs_tensor = obs_tensor.unsqueeze(0)
         if goal_tensor.ndim == 1:
             goal_tensor = goal_tensor.unsqueeze(0)
-
         dist, mean, _ = self.actor(obs_tensor, goal_tensor, temperature=1.0)
         act = mean if deterministic else dist.sample()
         return torch.clamp(act, -1.0, 1.0)
@@ -374,7 +373,7 @@ class GCIQLAgent:
         torch.save(payload, path)
 
     def load(self, path: str, load_optimizers: bool = True) -> None:
-        payload = torch.load(path, map_location=self.device)
+        payload = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(payload["actor"])
         self.critic.load_state_dict(payload["critic"])
         self.target_critic.load_state_dict(payload["target_critic"])
@@ -467,9 +466,9 @@ class GCIQLAgent:
             q_actions = mean if self.config.const_std else dist.rsample()
             q_actions = torch.clamp(q_actions, -1.0, 1.0)
             q1, q2 = self.critic(obs, goals, q_actions)
-            q = torch.min(q1, q2).detach()
+            q = torch.min(q1, q2)
 
-            q_scale = q.abs().mean().clamp(min=1e-6)
+            q_scale = q.abs().mean().clamp(min=1e-6).detach()
             q_loss = -q.mean() / q_scale
             bc_loss = -(self.config.alpha * log_prob).mean()
             loss = q_loss + bc_loss

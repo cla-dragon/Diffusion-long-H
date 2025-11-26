@@ -70,6 +70,7 @@ def pipeline(args):
         policy_dataset = GCDataset(
             dataset,
             args.low_controller,
+            planner_dataset.get_normalizer(),
             preprocess_frame_stack=False,
         )
     planner_dataloader = DataLoader(
@@ -180,13 +181,72 @@ def pipeline(args):
             # ----------- Logging ------------
             if (n_gradient_step + 1) % args.log_interval == 0:
                 log["gradient_steps"] = n_gradient_step + 1
-                log["avg_loss_planner"] /= args.log_interval
-                log["bc_loss_policy"] /= args.log_interval
+                for key in log.keys():
+                    if key != "gradient_steps":
+                        log[key] /= args.log_interval
                 print(log)
                 if args.enable_wandb:
                     wandb.log(log, step=n_gradient_step + 1)
                 pbar.update(1)
-                log = {"gradient_steps": 0, "avg_loss_planner": 0., "bc_loss_policy": 0.}
+                if args.use_diffusion_invdyn:
+                    log = {"gradient_steps": 0, "avg_loss_planner": 0., "bc_loss_policy": 0.}
+                else:
+                    log = {"gradient_steps": 0, "avg_loss_planner": 0., 
+                        "policy_loss_value": 0., "policy_loss_critic": 0., "policy_loss_actor": 0.}
+                    
+            # ----------- Evalutation ------------
+            if (n_gradient_step + 1) % args.eval_interval == 0:
+                planner.eval()
+                if args.use_diffusion_invdyn:
+                    policy.eval()
+                else:
+                    invdyn.eval()
+
+                renders = []
+                eval_metrics = {}
+                overall_metrics = defaultdict(list)
+                task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
+                num_tasks = len(task_infos)
+                for task_id in trange(1, num_tasks + 1):
+                    task_name = task_infos[task_id - 1]['task_name']
+                    eval_info, trajs, cur_renders = single_layer_evaluate(
+                        diffusions_model=planner,
+                        mode=args.low_controller_mode,
+                        low_controller=policy if args.use_diffusion_invdyn else invdyn,
+                        env=env,
+                        normalizer=planner_dataset.get_normalizer(),
+                        task_id=task_id,
+                        horizon=args.task.planner_horizon,
+                        obs_dim=obs_dim,
+                        act_dim=act_dim,
+                        config=args,
+                        num_eval_episodes=args.num_eval_episodes,
+                        num_video_episodes=args.num_video_episodes,
+                        video_frame_skip=args.video_frame_skip,
+                    )
+                    renders.extend(cur_renders)
+                    metric_names = ['success']
+                    eval_metrics.update(
+                        {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
+                    )
+                    for k, v in eval_info.items():
+                        if k in metric_names:
+                            overall_metrics[k].append(v)
+
+                for k, v in overall_metrics.items():
+                    eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+
+                if args.num_video_episodes > 0:
+                    video = get_wandb_video(renders=renders, n_cols=num_tasks)
+                    eval_metrics['video'] = video 
+
+                wandb.log(eval_metrics, step=n_gradient_step + 1)
+
+                planner.train()
+                if args.use_diffusion_invdyn:
+                    policy.train()
+                else:
+                    invdyn.train()
             
             # ----------- Save Model ------------
             if (n_gradient_step + 1) % args.save_interval == 0:
@@ -223,9 +283,9 @@ def pipeline(args):
         num_tasks = len(task_infos)
         for task_id in trange(1, num_tasks + 1):
             task_name = task_infos[task_id - 1]['task_name']
-            eval_info, trajs, cur_renders, cur_plan, cur_subgoal = single_layer_evaluate(
+            eval_info, trajs, cur_renders = single_layer_evaluate(
                 diffusions_model=planner,
-                mode=None,
+                mode=args.low_controller_mode,
                 low_controller=policy if args.use_diffusion_invdyn else invdyn,
                 env=env,
                 normalizer=planner_dataset.get_normalizer(),

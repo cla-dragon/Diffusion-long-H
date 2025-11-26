@@ -4,3 +4,7 @@ max_path_length: 1001
 planner_horizon: 150
 planner_temperature: 1.0
 w_ldg: 0
+
+low_horizon: 10
+goal_tol: 3.0
+replan_every: 100

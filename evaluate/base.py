@@ -45,6 +45,8 @@ def single_layer_evaluate(
     """
     Evaluates the single layer agent(not hierarchical) on a single task.
     """
+    assert mode in ['plan_every_step', 'achieve_subgoal'], "Invalid evaluation mode!"
+
     # Templates for planning priors
     prior_template = torch.zeros((1, horizon, obs_dim), device=config.device)
 
@@ -67,37 +69,53 @@ def single_layer_evaluate(
         rendered_frames_for_this_episode = []
         
         current_plan_observations = None 
-        current_subgoal_for_gciql = None   
-        current_subgoal_idx_in_plan = -1 
+        current_subgoal_obs = None   
+        current_subgoal_idx_in_plan = -1
 
         while (not episode_done) and (current_episode_step < max_episode_lengths[config.task.env_name]):
-            # if current_episode_step == 0 or \
-            #    (config.task.replan_every > 0 and current_episode_step % config.task.replan_every == 0):
             normalized_current_obs = normalizer.normalize(obs[:obs_dim][None])
             normalized_task_goal = normalizer.normalize(task_overall_goal_state[:obs_dim][None])
+            
+            # Planning Step
+            if current_episode_step == 0 or \
+               (config.task.replan_every > 0 and current_episode_step % config.task.replan_every == 0) or \
+                (mode == 'plan_every_step'):
+                # Create priors for planning
+                current_prior = prior_template.clone()
+                current_prior[:, 0] = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32)
+                current_prior[:, -1] = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32)
 
-            # Create priors for planning
-            current_prior = prior_template.clone()
-            current_prior[:, 0] = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32)
-            current_prior[:, -1] = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32)
+                # Planning
+                traj_normalized, _ = diffusions_model.sample(
+                    current_prior.repeat(config.planner_num_candidates, 1, 1),
+                    solver=config.planner_solver, n_samples=config.planner_num_candidates,
+                    sample_steps=config.planner_sampling_steps, use_ema=config.planner_use_ema,
+                    temperature=config.task.planner_temperature,
+                    w_ldg=config.task.w_ldg
+                )
+                # Select the best plan
+                # TODO: N-step Q value estimator
+                idx = 0
+                current_plan_observations = normalizer.unnormalize(traj_normalized[idx, :, :].cpu().numpy())
+                current_subgoal_idx_in_plan = min(config.task.low_horizon, current_plan_observations.shape[0] - 1)
+                current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
 
-            # Planning
-            traj_normalized, _ = diffusions_model.sample(
-                current_prior.repeat(config.planner_num_candidates, 1, 1),
-                solver=config.planner_solver, n_samples=config.planner_num_candidates,
-                sample_steps=config.planner_sampling_steps, use_ema=config.planner_use_ema,
-                temperature=config.task.planner_temperature,
-                w_ldg=config.task.w_ldg
-            )
-            # Select the best plan
-            # TODO: N-step Q value estimator
-            idx = 0
+            # Subgoal Selection and Update
+            elif mode == 'achieve_subgoal':
+                # Update subgoal if reached
+                distance_to_subgoal = np.linalg.norm(obs[:obs_dim] - current_subgoal_obs)
+                if distance_to_subgoal <= config.task.goal_tol: 
+                    current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + config.task.low_horizon, current_plan_observations.shape[0] - 1)
+                    current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
+                    print(f"Subgoal reached, updating to index {current_subgoal_idx_in_plan}.")
+                
+            # Low-Level Control
             if config.use_diffusion_invdyn:
                 policy_prior = torch.zeros((1, act_dim), device=config.device)
                 with torch.no_grad():
-                    next_obs_plan = traj_normalized[idx, 1, :].unsqueeze(0)
-                    obs_policy = torch.tensor(obs.copy(), device=config.device, dtype=torch.float32).unsqueeze(0)
-                    next_obs_policy = next_obs_plan.clone()
+                    next_obs_plan = normalizer.normalize(current_subgoal_obs)
+                    obs_policy = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32).unsqueeze(0)
+                    next_obs_policy = torch.tensor(next_obs_plan, device=config.device, dtype=torch.float32).unsqueeze(0)
                     act, log = low_controller.sample(
                                 policy_prior,
                                 solver=config.policy_solver,
@@ -110,7 +128,7 @@ def single_layer_evaluate(
             else:
                 # inverse dynamic
                 with torch.no_grad():
-                    action = low_controller.predict(obs, traj_normalized[:, 1, :]).clip(-1., 1.).cpu().numpy()
+                    action = low_controller.predict(normalized_current_obs, normalizer.normalize(current_subgoal_obs)).clip(-1., 1.).squeeze().cpu().numpy()
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             episode_done = info['success']
@@ -152,4 +170,101 @@ def single_layer_evaluate(
         elif v_list: # Handle non-numeric summary data if any (e.g. list of strings)
             aggregated_stats_for_this_task[k] = v_list
 
-    return aggregated_stats_for_this_task, task_trajectories, task_renders_list, current_plan_observations, current_subgoal_for_gciql
+    return aggregated_stats_for_this_task, task_trajectories, task_renders_list
+
+
+def low_controller_evaluate(
+    low_controller,
+    env,
+    normalizer,
+    task_id,
+    obs_dim,
+    act_dim,
+    config,
+    num_eval_episodes,
+    num_video_episodes,
+    video_frame_skip,
+):
+    """Evaluate only a low-level controller on a single OGBench task.
+
+    与 single_layer_evaluate 不同，这里不做高层规划，直接让 low_controller
+    在 (obs, goal) 条件下选择动作。为了简单起见，我们用环境给出的 overall goal
+    作为条件 g：low_controller.predict(obs, goal_state)。
+    """
+
+    task_trajectories = []
+    task_stats_collector = defaultdict(list)
+    task_renders_list = []
+
+    for i_episode in trange(num_eval_episodes + num_video_episodes, desc=f"Task {task_id} Episodes", leave=False):
+        current_episode_trajectory_data = defaultdict(list)
+        is_video_episode = i_episode >= num_eval_episodes
+        reset_options = {"task_id": task_id}
+        reset_options["render_goal"] = is_video_episode
+
+        obs, info = env.reset(options=reset_options)
+        task_overall_goal_state = info.get("goal")
+        goal_frame_rendered_from_env = info.get("goal_rendered")
+
+        episode_done = False
+        current_episode_step = 0
+        rendered_frames_for_this_episode = []
+
+        while (not episode_done) and (current_episode_step < max_episode_lengths[config.task.env_name]):
+            # 直接用环境给的 final goal 作为条件
+            normalized_current_obs = normalizer.normalize(obs[:obs_dim][None])
+            normalized_task_goal = normalizer.normalize(task_overall_goal_state[:obs_dim][None])
+
+            with torch.no_grad():
+                obs_tensor = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32).squeeze(0)
+                goal_tensor = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32).squeeze(0)
+                action = (
+                    low_controller.predict(obs_tensor, goal_tensor)
+                    .clip(-1.0, 1.0)
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                )
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            episode_done = info.get("success", bool(terminated or truncated))
+            current_episode_step += 1
+
+            if is_video_episode and (current_episode_step % video_frame_skip == 0 or episode_done):
+                frame = env.render().copy()
+                if goal_frame_rendered_from_env is not None:
+                    rendered_frames_for_this_episode.append(
+                        np.concatenate([goal_frame_rendered_from_env, frame], axis=0)
+                    )
+                else:
+                    rendered_frames_for_this_episode.append(frame)
+
+            if not is_video_episode:
+                transition_payload = dict(
+                    observation=obs.copy(),
+                    next_observation=next_obs.copy(),
+                    action=action.copy(),
+                    reward=reward,
+                    done=bool(terminated or truncated),
+                    info=info.copy(),
+                )
+                add_to(current_episode_trajectory_data, transition_payload)
+
+            obs = next_obs
+
+        if not is_video_episode:
+            task_trajectories.append(dict(current_episode_trajectory_data))
+            add_to(task_stats_collector, flatten(info))
+        else:
+            if rendered_frames_for_this_episode:
+                task_renders_list.append(np.array(rendered_frames_for_this_episode))
+
+    aggregated_stats_for_this_task = {}
+    for k, v_list in task_stats_collector.items():
+        numeric_vals = [x for x in v_list if isinstance(x, (int, float, np.number))]
+        if numeric_vals:
+            aggregated_stats_for_this_task[k] = np.mean(numeric_vals)
+        elif v_list:
+            aggregated_stats_for_this_task[k] = v_list
+
+    return aggregated_stats_for_this_task, task_trajectories, task_renders_list

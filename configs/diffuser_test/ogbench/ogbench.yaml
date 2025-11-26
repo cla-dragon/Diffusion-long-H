@@ -4,10 +4,10 @@ defaults:
   - low_controller: gciql
 
 pipeline_name: diffuser+gciql_test
-run_alias: basic_gciql_test
+run_alias: re_gciql_achieve_subgoal
 mode: train
 seed: 0
-device: cuda:2
+device: cuda:6
 project: Diffusion_OG
 group: debug
 # name: diffuser_test
@@ -43,24 +43,26 @@ critic_learning_rate: 0.0003
 
 # Training
 use_diffusion_invdyn: 0
-invdyn_gradient_steps: 200000
-policy_diffusion_gradient_steps: 1000000
-planner_diffusion_gradient_steps: 1000000
-batch_size: 128
+invdyn_gradient_steps: 600000
+policy_diffusion_gradient_steps: 600000
+planner_diffusion_gradient_steps: 600000
+batch_size: 256
 log_interval: 1000
+eval_interval: 5000
 save_interval: 100000
 
 # Inference
 num_envs: 1
 # num_episodes: 20
 planner_num_candidates: 20
-planner_ckpt: 1000000
+planner_ckpt: latest
 critic_ckpt: 200000
 policy_ckpt: 1000000
-invdyn_ckpt: 200000
+invdyn_ckpt: latest
 planner_use_ema: True
 policy_temperature: 0.5
 policy_use_ema: True
+low_controller_mode: achieve_subgoal # achieve_subgoal or plan_every_step
 
 num_eval_episodes: 50
 num_video_episodes: 1

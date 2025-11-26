@@ -124,9 +124,10 @@ class GCDataset(BaseDataset):
             saves memory but may slow down training.
     """
 
-    def __init__(self, dataset, config, preprocess_frame_stack=True):
+    def __init__(self, dataset, config, normalizer, preprocess_frame_stack=True):
         self.dataset = dataset
         self.config = config
+        self.normalizer = normalizer
         self.preprocess_frame_stack = preprocess_frame_stack
         self.size = len(self.dataset['observations'])
 
@@ -239,7 +240,7 @@ class GCDataset(BaseDataset):
     def get_observations(self, idxs):
         """Return the observations for the given indices."""
         if self.config['frame_stack'] is None or self.preprocess_frame_stack:
-            return  self.dataset['observations'][idxs]
+            return  self.normalizer.normalize(self.dataset['observations'][idxs])
         else:
             return self.get_stacked_observations(idxs)
 
@@ -249,7 +250,7 @@ class GCDataset(BaseDataset):
         rets = []
         for i in reversed(range(self.config['frame_stack'])):
             cur_idxs = np.maximum(idxs - i, initial_state_idxs)
-            rets.append(self.dataset['observations'][cur_idxs])
+            rets.append(self.normalizer.normalize(self.dataset['observations'][cur_idxs]))
         return  np.concatenate(rets, axis=-1)
     
     def __len__(self):
