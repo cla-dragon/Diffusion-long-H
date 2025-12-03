@@ -4,9 +4,14 @@ import uuid
 import os
 import json
 import wandb
-import wandb.sdk.data_types.video as wv
 import numpy as np
 import torch
+
+import math
+from typing import Optional
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import get_cmap
 from omegaconf import OmegaConf
 
 from PIL import Image, ImageEnhance
@@ -161,7 +166,168 @@ def get_wandb_video(renders=None, n_cols=None, fps=15):
 
     return wandb.Video(renders, fps=fps, format='mp4')
     
-    
 
+def visualize_3d_trajectories_wandb(
+    traj: np.ndarray,
+    n_cols: Optional[int] = None,
+    cmap_name: str = "viridis",
+    figsize_per_plot: float = 4.0,
+    num_points: int = 20,
+) -> wandb.Image:
+    """
+    可视化 3D 轨迹，并打包成单张网格图，返回 wandb.Image 方便日志记录。
+
+    参数:
+        traj: numpy.ndarray, shape [B, object_num, T, 3]
+            B: batch size
+            object_num: 物体数量
+            T: 序列长度
+            末维为 (x, y, z)
+        n_cols: 网格列数, 如果为 None 则约取 sqrt(B)
+        cmap_name: 轨迹渐变色的 colormap 名字
+        figsize_per_plot: 每个子图的边长（英寸）
+
+    返回:
+        wandb.Image
+    """
+    assert traj.ndim == 4 and traj.shape[-1] == 3, \
+        f"traj shape 必须为 [B, object_num, T, 3]，当前为 {traj.shape}"
+    
+    cmap_names = ['Blues', 'Oranges', 'Greens', 'Purples']
+
+    B, object_num, T, _ = traj.shape
+    indices = np.linspace(0, T - 1, num_points)
+    indices = np.round(indices).astype(int)
+
+    if n_cols is None:
+        n_cols = int(math.ceil(math.sqrt(B)))
+    n_rows = int(math.ceil(B / n_cols))
+
+    fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
+    norm = Normalize(vmin=-num_points/2, vmax=num_points - 1)
+
+    for b in range(B):
+        row = b // n_cols
+        col = b % n_cols
+        ax = fig.add_subplot(n_rows, n_cols, b + 1, projection="3d")
+        ax.set_title(f"Sample {b}", fontsize=8)
+
+        # 对每个 object 画一条轨迹
+        for o in range(object_num):
+            cmap = get_cmap(cmap_names[o % len(cmap_names)])  # 使用不同的 colormap
+            traj_o = traj[b, o]  # [T, 3]
+            xs, ys, zs = traj_o[indices, 0], traj_o[indices, 1], traj_o[indices, 2]
+
+            # 轨迹渐变色散点
+            colors = cmap(norm(np.arange(num_points)))
+            ax.scatter(xs, ys, zs, c=colors, s=20)
+
+            # 初始位置: '+'
+            ax.scatter(
+                xs[0], ys[0], zs[0],
+                c=[cmap(norm(num_points - 1))],
+                marker="+",
+                s=100,
+                linewidths=2,
+            )
+
+            # 最终位置: 'x'
+            ax.scatter(
+                xs[-1], ys[-1], zs[-1],
+                c=[cmap(norm(num_points - 1))],
+                marker="x",
+                s=100,
+                linewidths=2,
+            )
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        # 适当设置相同尺度，避免比例失真
+        all_xyz = traj[b].reshape(-1, 3)
+        x_min, y_min, z_min = all_xyz.min(axis=0)
+        x_max, y_max, z_max = all_xyz.max(axis=0)
+        max_range = max(x_max - x_min, y_max - y_min, z_max - z_min) + 1e-6
+        x_center = (x_max + x_min) / 2.0
+        y_center = (y_max + y_min) / 2.0
+        z_center = (z_max + z_min) / 2.0
+        half = max_range / 2.0
+        ax.set_xlim(x_center - half, x_center + half)
+        ax.set_ylim(y_center - half, y_center + half)
+        ax.set_zlim(z_center - half, z_center + half)
+
+    plt.tight_layout()
+
+    # 转成 numpy 图像 (H, W, C) 用于 wandb.Image
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8) # (H, W, 4)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))  # (H, W, 4)
+    img = buf[:, :, :3]
+    plt.close(fig)
+
+    return wandb.Image(img)
 
     
+def save_3d_trajectories_image(
+    traj: np.ndarray,
+    path: str,
+    n_cols: Optional[int] = None,
+    cmap_name: str = "viridis",
+    figsize_per_plot: float = 4.0,
+):
+    """
+    可视化 3D 轨迹，并直接保存到本地图片文件。
+
+    参数:
+        traj: numpy.ndarray, shape [B, object_num, T, 3]
+        path: 输出图片路径，例如 "traj_3d_test.png"
+    """
+    assert traj.ndim == 4 and traj.shape[-1] == 3, \
+        f"traj shape 必须为 [B, object_num, T, 3]，当前为 {traj.shape}"
+
+    B, object_num, T, _ = traj.shape
+
+    if n_cols is None:
+        n_cols = int(math.ceil(math.sqrt(B)))
+    n_rows = int(math.ceil(B / n_cols))
+
+    fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
+    cmap = get_cmap(cmap_name)
+    norm = Normalize(vmin=0, vmax=T - 1)
+
+    for b in range(B):
+        ax = fig.add_subplot(n_rows, n_cols, b + 1, projection="3d")
+        ax.set_title(f"Sample {b}", fontsize=8)
+
+        for o in range(object_num):
+            traj_o = traj[b, o]  # [T, 3]
+            xs, ys, zs = traj_o[:, 0], traj_o[:, 1], traj_o[:, 2]
+
+            colors = cmap(norm(np.arange(T)))
+            ax.scatter(xs, ys, zs, c=colors, s=5)
+
+            ax.scatter(xs[0], ys[0], zs[0],
+                       c=[cmap(norm(0))], marker="+", s=50, linewidths=2)
+            ax.scatter(xs[-1], ys[-1], zs[-1],
+                       c=[cmap(norm(T - 1))], marker="x", s=50, linewidths=2)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        all_xyz = traj[b].reshape(-1, 3)
+        x_min, y_min, z_min = all_xyz.min(axis=0)
+        x_max, y_max, z_max = all_xyz.max(axis=0)
+        max_range = max(x_max - x_min, y_max - y_min, z_max - z_min) + 1e-6
+        x_center = (x_max + x_min) / 2.0
+        y_center = (y_max + y_min) / 2.0
+        z_center = (z_max + z_min) / 2.0
+        half = max_range / 2.0
+        ax.set_xlim(x_center - half, x_center + half)
+        ax.set_ylim(y_center - half, y_center + half)
+        ax.set_zlim(z_center - half, z_center + half)
+
+    plt.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)

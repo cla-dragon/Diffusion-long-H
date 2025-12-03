@@ -3,9 +3,9 @@ from typing import Optional
 from cleandiffuser.nn_classifier import BaseNNClassifier
 from cleandiffuser.classifier.base import BaseClassifier
 
-# Classifier that predicts cumulative reward in goal-conditioned settings: Q(s, a, g)
+# Classifier that calculate the goal distance in goal-conditioned settings: Q(s, a, g)
 # Adapted from CumRewClassifier
-class GCCumRewClassifier(BaseClassifier):
+class GCDistance(BaseClassifier):
     def __init__(
             self,
             nn_classifier: BaseNNClassifier,
@@ -15,8 +15,7 @@ class GCCumRewClassifier(BaseClassifier):
         super().__init__(nn_classifier, 0.995, None, optim_params, device)
 
     def loss(self, x, noise, R):
-        pred_R = self.model(x, noise, None)
-        return ((pred_R - R) ** 2).mean()
+        return 0
 
     def update(self, x, noise, R):
         self.optim.zero_grad()
@@ -27,4 +26,4 @@ class GCCumRewClassifier(BaseClassifier):
         return {"loss": loss.item()}
 
     def logp(self, x, noise, c=None):
-        return self.model_ema(x, noise)
+        return (x-c)**2

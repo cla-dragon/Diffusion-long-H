@@ -1,8 +1,8 @@
 import torch
 
-mean = torch.zeros(2)
-std = torch.ones(2)
-dist = torch.distributions.Normal(mean, std)
-dist = torch.distributions.Independent(dist, 1)
-log_prob = dist.log_prob(torch.tensor([[0.5, -0.5], [0, 0.0]]))
-print(log_prob)
+horizon = 10
+obs_dim = 3
+prior_template = torch.zeros((1, horizon, obs_dim))
+prior_template[:,0] = 1
+prior_template[:,-1] = 2
+print(prior_template)

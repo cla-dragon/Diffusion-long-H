@@ -4,7 +4,7 @@ defaults:
   - low_controller: gciql
 
 pipeline_name: diffuser+gciql_test
-run_alias: re_gciql_achieve_subgoal
+run_alias: guide_gciql_achieve_subgoal
 mode: train
 seed: 0
 device: cuda:6
@@ -14,6 +14,7 @@ group: debug
 enable_wandb: true
 
 # Guidance
+enable_distance_guidance: true
 # guidance_type: MCSS # cfg, cg, MCSS
 
 
