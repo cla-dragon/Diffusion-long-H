@@ -30,6 +30,12 @@ from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from evaluate import single_layer_evaluate
 from pipelines.utils import get_wandb_video, visualize_3d_trajectories_wandb
 
+object_num = {
+    "cube-single-play-v0": 1,
+    "cube-double-play-v0": 2,
+    "cube-triple-play-v0": 3,
+}
+
 @hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench", version_base=None)
 def pipeline(args):
     args.device = args.device if torch.cuda.is_available() else "cpu"
@@ -91,8 +97,14 @@ def pipeline(args):
     print(f"==============================================================================")
 
     # --------------- Classifier Guidance --------------------
-    # NOTE:No classifier guidance for Goal-Conditioned OGBench for now
-    # classifier = CumRewClassifier(nn_classifier, device=args.device)
+    classifier = None
+    if args.enable_distance_guidance:
+        nn_classifier = MLPNNClassifier(1,1,1,[8,8]) # not used
+        distance_dims = []
+        for i in range(object_num.get(args.task.env_name, 1)):
+            distance_dims.extend(list(range(-9*i-9, -9*i-6)))  # x,y,z of each object
+        distance_dims = torch.tensor(distance_dims, device=args.device)
+        classifier = GCDistance(nn_classifier, device=args.device, distance_dims=distance_dims)
 
     # ----------------- Masking -------------------
     fix_mask = torch.zeros((args.task.planner_horizon, obs_dim))
@@ -103,10 +115,6 @@ def pipeline(args):
     # loss_weight[0, obs_dim:] = args.planner_next_obs_loss_weight
 
     # --------------- Diffusion Model --------------------
-    classifier = None
-    if args.enable_distance_guidance:
-        nn_classifier = MLPNNClassifier(1,1,1,[8,8]) # not used
-        classifier = GCDistance(nn_classifier, device=args.device)
     planner = ContinuousDiffusionSDE(
         nn_diffusion_planner, nn_condition=None,
         fix_mask=fix_mask, loss_weight=loss_weight, classifier=classifier, ema_rate=args.planner_ema_rate,
@@ -126,10 +134,14 @@ def pipeline(args):
             x_min=-1. * torch.ones((1, act_dim), device=args.device),
             diffusion_steps=args.policy_diffusion_steps, ema_rate=args.policy_ema_rate, device=args.device)
     else:
+        if args.plan_only_object_goal:
+            goal_dim = 9 * object_num.get(args.task.env_name, 1)  # only plan for object position
+        else:
+            goal_dim = obs_dim
         invdyn = GCIQLAgent(
             obs_dim=obs_dim,
             action_dim=act_dim,
-            goal_dim=obs_dim,           # 这里假设 goal 也是 state 维度
+            goal_dim=goal_dim,
             config=args.low_controller,
             device=args.device,
         )
@@ -166,6 +178,9 @@ def pipeline(args):
                 policy_horizon_obs = policy_batch["obs"]["state"].to(args.device)
                 policy_horizon_action = policy_batch["act"].to(args.device)
                 policy_td_obs, policy_td_next_obs, policy_td_act = policy_horizon_obs[:,0,:], policy_horizon_obs[:,1,:], policy_horizon_action[:,0,:]
+            elif args.plan_only_object_goal:
+                policy_batch['value_goals'] = policy_batch['value_goals'][:, -goal_dim:]
+                policy_batch['actor_goals'] = policy_batch['actor_goals'][:, -goal_dim:]
 
             # ----------- Gradient Step ------------
             log["avg_loss_planner"] += planner.update(planner_horizon_data)['loss']
@@ -290,11 +305,12 @@ def pipeline(args):
         renders = []
         eval_metrics = {}
         overall_metrics = defaultdict(list)
+        overall_trajectories_3d = []
         task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
         num_tasks = len(task_infos)
         for task_id in trange(1, num_tasks + 1):
             task_name = task_infos[task_id - 1]['task_name']
-            eval_info, trajs, cur_renders = single_layer_evaluate(
+            eval_info, trajs, cur_renders, trajs_planned_3d = single_layer_evaluate(
                 diffusions_model=planner,
                 mode=args.low_controller_mode,
                 low_controller=policy if args.use_diffusion_invdyn else invdyn,
@@ -310,6 +326,7 @@ def pipeline(args):
                 video_frame_skip=args.video_frame_skip,
             )
             renders.extend(cur_renders)
+            overall_trajectories_3d.append(trajs_planned_3d[0]) # only log the first vision episode of each task
             metric_names = ['success']
             eval_metrics.update(
                 {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
@@ -323,7 +340,11 @@ def pipeline(args):
 
         if args.num_video_episodes > 0:
             video = get_wandb_video(renders=renders, n_cols=num_tasks)
-            eval_metrics['video'] = video 
+            eval_metrics['video'] = video
+            # 3D Trajectory Visualization
+            trajs_planned_3d = np.array(overall_trajectories_3d)  # [B, object_num, T, 3]
+            trajs_image = visualize_3d_trajectories_wandb(trajs_planned_3d, n_cols=num_tasks)
+            eval_metrics['3d_trajectories'] = trajs_image
 
         wandb.log(eval_metrics, step=1)
 

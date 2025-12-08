@@ -204,7 +204,7 @@ def visualize_3d_trajectories_wandb(
     n_rows = int(math.ceil(B / n_cols))
 
     fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
-    norm = Normalize(vmin=-num_points/2, vmax=num_points - 1)
+    norm = Normalize(vmin=-num_points/3, vmax=num_points - 1)
 
     for b in range(B):
         row = b // n_cols

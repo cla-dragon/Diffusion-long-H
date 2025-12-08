@@ -1,3 +1,4 @@
+import torch
 from typing import Optional
 
 from cleandiffuser.nn_classifier import BaseNNClassifier
@@ -11,8 +12,10 @@ class GCDistance(BaseClassifier):
             nn_classifier: BaseNNClassifier,
             device: str = "cpu",
             optim_params: Optional[dict] = None,
+            distance_dims: Optional[torch.Tensor] = None,
     ):
         super().__init__(nn_classifier, 0.995, None, optim_params, device)
+        self.distance_dims = distance_dims
 
     def loss(self, x, noise, R):
         return 0
@@ -26,4 +29,9 @@ class GCDistance(BaseClassifier):
         return {"loss": loss.item()}
 
     def logp(self, x, noise, c=None):
-        return (x-c)**2
+        if self.distance_dims is not None:
+            diff = (x - c)[:, :, self.distance_dims] # (B, T, state_dim)
+        else:
+            diff = x - c
+        dist = (diff ** 2).mean(-1, keepdim=True)
+        return -dist

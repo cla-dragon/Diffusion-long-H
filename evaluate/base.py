@@ -55,6 +55,10 @@ def single_layer_evaluate(
 
     # Templates for planning priors
     prior_template = torch.zeros((1, horizon, obs_dim), device=config.device)
+    if config.plan_only_object_goal:
+        goal_dim = 9 * object_num.get(config.task.env_name, 1)
+    else:
+        goal_dim = obs_dim
 
     task_trajectories = []
     task_stats_collector = defaultdict(list)
@@ -86,7 +90,7 @@ def single_layer_evaluate(
             # Planning Step
             if current_episode_step == 0 or \
                (config.task.replan_every > 0 and current_episode_step % config.task.replan_every == 0) or \
-                (mode == 'plan_every_step'):
+                (mode == 'plan_every_step') or (mode == 'achieve_subgoal' and current_subgoal_idx_in_plan >= current_plan_observations.shape[0] -1):
                 # Create priors for planning
                 current_prior = prior_template.clone()
                 current_prior[:, 0] = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32)
@@ -97,7 +101,7 @@ def single_layer_evaluate(
                 if config.enable_distance_guidance:
                     condition_cg = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32).unsqueeze(1) # [1, 1, obs_dim]
                     condition_cg = condition_cg.repeat(config.planner_num_candidates, horizon, 1)  # [num_candidates, horizon, obs_dim]
-                    w_cg = 1.0
+                    w_cg = 0.5
                 else:
                     condition_cg = None
                     w_cg = 0.0
@@ -114,18 +118,19 @@ def single_layer_evaluate(
                 current_subgoal_idx_in_plan = min(config.task.low_horizon - 1, current_plan_observations.shape[0] - 1)
                 current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
             
-            if current_episode_step == 0 and is_video_episode:
-                # Visualize the planned 3D trajectory at the start of the episode
-                object_num_in_env = object_num.get(config.task.env_name, 1)
-                traj_3d = np.zeros((object_num_in_env, current_plan_observations.shape[0], 3))
-                for i in range(object_num.get(config.task.env_name, 1)):
-                    traj_3d[i] = np.array(current_plan_observations[:, -9*i-9:-9*i-6])  # (T, 3)
-                task_trajectories_3d.append(traj_3d)
+                if current_episode_step == 0 and is_video_episode:
+                    # Visualize the planned 3D trajectory at the start of the episode
+                    object_num_in_env = object_num.get(config.task.env_name, 1)
+                    traj_3d = np.zeros((object_num_in_env, current_plan_observations.shape[0], 3))
+                    for i in range(object_num.get(config.task.env_name, 1)):
+                        traj_3d[i] = np.array(current_plan_observations[:, -9*i-9:-9*i-6])  # (T, 3)
+                        traj_3d[i, -1, :] = task_overall_goal_state[:obs_dim][-9*i-9:-9*i-6]  # Set final point to goal
+                    task_trajectories_3d.append(traj_3d)
 
             # Subgoal Selection and Update
             elif mode == 'achieve_subgoal':
                 # Update subgoal if reached
-                distance_to_subgoal = np.linalg.norm(obs[:obs_dim] - current_subgoal_obs)
+                distance_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[-goal_dim:])
                 if distance_to_subgoal <= config.task.goal_tol: 
                     current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + config.task.low_horizon, current_plan_observations.shape[0] - 1)
                     current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
@@ -149,8 +154,9 @@ def single_layer_evaluate(
                     action = act.clip(-1., 1.).squeeze().cpu().numpy()
             else:
                 # inverse dynamic
+                normalized_subgoal_obs_for_low = normalizer.normalize(current_subgoal_obs)[-goal_dim:]
                 with torch.no_grad():
-                    action = low_controller.predict(normalized_current_obs, normalizer.normalize(current_subgoal_obs)).clip(-1., 1.).squeeze().cpu().numpy()
+                    action = low_controller.predict(normalized_current_obs, normalized_subgoal_obs_for_low).clip(-1., 1.).squeeze().cpu().numpy()
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             episode_done = info['success']
