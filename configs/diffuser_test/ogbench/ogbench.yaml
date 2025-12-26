@@ -4,10 +4,10 @@ defaults:
   - low_controller: gciql
 
 pipeline_name: diffuser+gciql_test
-run_alias: fix_short_gciql_achieve_subgoal
-mode: train
+run_alias: fix_short_0.95_gciql_achieve_subgoal
+mode: inference
 seed: 0
-device: cuda:0
+device: cuda:2
 project: Diffusion_OG
 group: debug
 # name: diffuser_test

@@ -5,6 +5,6 @@ planner_horizon: 200
 planner_temperature: 1.0
 w_ldg: 0
 
-low_horizon: 20
+low_horizon: 50
 goal_tol: 0.5
-replan_every: 50
+replan_every: 100

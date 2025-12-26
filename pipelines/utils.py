@@ -172,7 +172,7 @@ def visualize_3d_trajectories_wandb(
     n_cols: Optional[int] = None,
     cmap_name: str = "viridis",
     figsize_per_plot: float = 4.0,
-    num_points: int = 20,
+    num_points: int = 30,
 ) -> wandb.Image:
     """
     可视化 3D 轨迹，并打包成单张网格图，返回 wandb.Image 方便日志记录。
@@ -204,7 +204,7 @@ def visualize_3d_trajectories_wandb(
     n_rows = int(math.ceil(B / n_cols))
 
     fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
-    norm = Normalize(vmin=-num_points/3, vmax=num_points - 1)
+    norm = Normalize(vmin=-num_points/4, vmax=num_points - 1)
 
     for b in range(B):
         row = b // n_cols
@@ -227,7 +227,7 @@ def visualize_3d_trajectories_wandb(
                 xs[0], ys[0], zs[0],
                 c=[cmap(norm(num_points - 1))],
                 marker="+",
-                s=100,
+                s=150,
                 linewidths=2,
             )
 
@@ -236,7 +236,7 @@ def visualize_3d_trajectories_wandb(
                 xs[-1], ys[-1], zs[-1],
                 c=[cmap(norm(num_points - 1))],
                 marker="x",
-                s=100,
+                s=150,
                 linewidths=2,
             )
 

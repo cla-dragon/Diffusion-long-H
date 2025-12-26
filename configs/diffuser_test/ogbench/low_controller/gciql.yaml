@@ -3,7 +3,7 @@ actor_lr: null
 critic_lr: null
 value_lr: null
 
-discount: 0.99
+discount: 0.95
 tau: 0.005
 expectile: 0.9
 alpha: 1.0

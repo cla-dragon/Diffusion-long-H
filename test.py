@@ -1,8 +1,5 @@
 import torch
-
-horizon = 10
-obs_dim = 3
-prior_template = torch.zeros((1, horizon, obs_dim))
-prior_template[:,0] = 1
-prior_template[:,-1] = 2
-print(prior_template)
+import numpy as np
+rand_dist = torch.randint(10, (8,)).unsqueeze(1)
+time_offsets = torch.arange(3).unsqueeze(0)
+print(rand_dist+time_offsets)  
