@@ -115,7 +115,11 @@ def single_layer_evaluate(
                 # TODO: N-step Q value estimator
                 idx = 0
                 current_plan_observations = normalizer.unnormalize(traj_normalized[idx, :, :].cpu().numpy())
-                current_subgoal_idx_in_plan = min(config.task.low_horizon - 1, current_plan_observations.shape[0] - 1)
+                
+                jump_steps = config.task.get('jump_steps', 1)
+                plan_lookahead = max(1, config.task.low_horizon // jump_steps)
+                
+                current_subgoal_idx_in_plan = min(plan_lookahead - 1, current_plan_observations.shape[0] - 1)
                 current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
             
                 if current_episode_step == 0 and is_video_episode:
@@ -132,7 +136,10 @@ def single_layer_evaluate(
                 # Update subgoal if reached
                 distance_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[-goal_dim:])
                 if distance_to_subgoal <= config.task.goal_tol: 
-                    current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + config.task.low_horizon, current_plan_observations.shape[0] - 1)
+                    jump_steps = config.task.get('jump_steps', 1)
+                    plan_lookahead = max(1, config.task.low_horizon // jump_steps)
+                    
+                    current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + plan_lookahead, current_plan_observations.shape[0] - 1)
                     current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
                     print(f"Subgoal reached, updating to index {current_subgoal_idx_in_plan}.")
                 

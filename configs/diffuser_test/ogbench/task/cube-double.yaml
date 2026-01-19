@@ -1,10 +1,11 @@
 env_name: "cube-double-play-v0"
 max_path_length: 1001
 
-planner_horizon: 200
+planner_horizon: 201
 planner_temperature: 1.0
 w_ldg: 0
 
-low_horizon: 50
-goal_tol: 0.5
-replan_every: 100
+jump_steps: 10
+low_horizon: 30
+goal_tol: 1.0
+replan_every: 200

@@ -14,6 +14,7 @@ class OGBenchDataset(BaseDataset):
             dataset: Dict[str, np.ndarray],
             horizon: int = 1,
             max_path_length: int = 4001,
+            jump_steps: int = 1,
     ):
         super().__init__()
 
@@ -28,6 +29,7 @@ class OGBenchDataset(BaseDataset):
         normed_observations = self.normalizers["state"].normalize(observations)
 
         self.horizon = horizon
+        self.jump_steps = jump_steps
         self.o_dim, self.a_dim = observations.shape[-1], actions.shape[-1]
 
         self.indices = []
@@ -87,8 +89,8 @@ class OGBenchDataset(BaseDataset):
 
         data = {
             'obs': {
-                'state': self.seq_obs[path_idx, start:end]},
-            'act': self.seq_act[path_idx, start:end],
+                'state': self.seq_obs[path_idx, start:end+1:self.jump_steps]},
+            'act': self.seq_act[path_idx, start:end+1:self.jump_steps],
         }
 
         torch_data = dict_apply(data, torch.tensor)
@@ -253,5 +255,40 @@ class GCDataset(BaseDataset):
             rets.append(self.normalizer.normalize(self.dataset['observations'][cur_idxs]))
         return  np.concatenate(rets, axis=-1)
     
+    def get_fixed_trajectories(self, num_trajectories=4, seed=None, min_length=20):
+        if seed is not None:
+            np.random.seed(seed)
+        
+        num_total = len(self.initial_locs)
+        
+        # Filter indices by length
+        valid_indices = []
+        for i in range(num_total):
+            start = self.initial_locs[i]
+            end = self.terminal_locs[i]
+            if end - start + 1 >= min_length:
+                valid_indices.append(i)
+                
+        valid_indices = np.array(valid_indices)
+        
+        # Ensure we don't sample more than available
+        n = min(num_trajectories, len(valid_indices))
+        if n == 0:
+            return []
+            
+        indices = np.random.choice(valid_indices, size=n, replace=False)
+        
+        trajs = []
+        for i in indices:
+            start = self.initial_locs[i]
+            end = self.terminal_locs[i] # inclusive
+            
+            # Get observations for this range
+            traj_indices = np.arange(start, end + 1)
+            obs = self.get_observations(traj_indices)
+            trajs.append(obs)
+            
+        return trajs
+
     def __len__(self):
         return self.size

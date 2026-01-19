@@ -1,13 +1,13 @@
 defaults:
   - _self_
-  - task: cube-single
+  - task: cube-double
   - low_controller: gciql
 
 pipeline_name: diffuser+gciql_test
-run_alias: fix_short_0.95_gciql_achieve_subgoal
+run_alias: subgoal_dis
 mode: inference
 seed: 0
-device: cuda:2
+device: cuda:0
 project: Diffusion_OG
 group: debug
 # name: diffuser_test
@@ -45,10 +45,10 @@ critic_learning_rate: 0.0003
 
 # Training
 use_diffusion_invdyn: 0
-invdyn_gradient_steps: 600000
-policy_diffusion_gradient_steps: 600000
-planner_diffusion_gradient_steps: 600000
-batch_size: 256
+invdyn_gradient_steps: 800000
+policy_diffusion_gradient_steps: 800000
+planner_diffusion_gradient_steps: 800000
+batch_size: 1024
 log_interval: 1000
 eval_interval: 5000
 save_interval: 100000

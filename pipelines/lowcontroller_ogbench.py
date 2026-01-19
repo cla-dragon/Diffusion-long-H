@@ -2,6 +2,9 @@ import os
 import ogbench
 import hydra, wandb, uuid
 import numpy as np
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
 from collections import defaultdict
 from omegaconf import OmegaConf
 from tqdm import trange
@@ -15,6 +18,59 @@ from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from cleandiffuser_sup.lowcontrol.gciql_inv import GCIQLAgent
 from evaluate import low_controller_evaluate
 from pipelines.utils import get_wandb_video
+
+
+def draw_value_curves(agent, trajectories, k_goals, device):
+    # trajectories: list of np.ndarray (T, obs_dim)
+    # k_goals: int
+    
+    if not trajectories:
+        return Image.new('RGB', (100, 100), color='white')
+
+    fig, axes = plt.subplots(1, k_goals, figsize=(5 * k_goals, 4))
+    if k_goals == 1:
+        axes = [axes]
+        
+    # For each goal index j (0 to k-1)
+    for j in range(k_goals):
+        ax = axes[j]
+        ax.set_title(f"Goal {j+1}/{k_goals}")
+        
+        for i, traj in enumerate(trajectories):
+            # traj: (T, obs_dim)
+            T = len(traj)
+            if T < 2:
+                continue
+                
+            # Determine goal index
+            # np.linspace(0, T-1, k+1)[1:] gives k points.
+            goal_indices = np.linspace(0, T-1, k_goals+1, dtype=int)[1:]
+            g_idx = goal_indices[j]
+            
+            goal = traj[g_idx] # (obs_dim,)
+            
+            # Prepare inputs for value net
+            obs_tensor = torch.from_numpy(traj).to(device).float()
+            goal_tensor = torch.from_numpy(goal).to(device).float().unsqueeze(0).expand(T, -1)
+            
+            with torch.no_grad():
+                values = agent.value_net(obs_tensor, goal_tensor).cpu().numpy().squeeze()
+            ax.plot(values, label=f"Traj {i}")
+            # Mark the goal position
+            ax.axvline(x=g_idx, linestyle="--", alpha=0.5)
+            
+        if j == 0:
+            ax.legend()
+            
+    plt.tight_layout()
+    
+    # Convert to image
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image = Image.open(buf)
+    plt.close(fig)
+    return image
 
 
 @hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench", version_base=None)
@@ -83,6 +139,10 @@ def pipeline(args):
 
     # ---------------------- Training ----------------------
     if args.mode == "train":
+        # Sample trajectories for visualization
+        eval_trajectories = policy_dataset.get_fixed_trajectories(num_trajectories=3, seed=args.seed)
+        k_goals = 4
+
         invdyn.train()
         n_gradient_step = 0
         log = {
@@ -168,6 +228,11 @@ def pipeline(args):
                 if args.num_video_episodes > 0:
                     video = get_wandb_video(renders=renders, n_cols=num_tasks)
                     eval_metrics['video'] = video 
+                
+                # Visualization of value curves
+                if args.enable_wandb:
+                    value_curves_plot = draw_value_curves(invdyn, eval_trajectories, k_goals, args.device)
+                    eval_metrics['evaluation/value_curves'] = wandb.Image(value_curves_plot)
 
                 if args.enable_wandb:
                     wandb.log(eval_metrics, step=n_gradient_step)

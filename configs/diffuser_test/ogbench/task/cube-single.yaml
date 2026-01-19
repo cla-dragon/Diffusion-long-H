@@ -1,10 +1,11 @@
 env_name: "cube-single-play-v0"
 max_path_length: 1001
 
-planner_horizon: 80
+planner_horizon: 81
 planner_temperature: 1.0
 w_ldg: 0
 
+jump_steps: 10
 low_horizon: 20
 goal_tol: 2.0
 replan_every: 100

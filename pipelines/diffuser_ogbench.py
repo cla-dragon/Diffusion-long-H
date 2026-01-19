@@ -61,16 +61,21 @@ def pipeline(args):
         compact_dataset=True,
     )
     obs_dim, act_dim = env.observation_space.shape[0], env.action_space.shape[0]
+    
+    jump_steps = args.task.get('jump_steps', 1)
+    
     planner_dataset = OGBenchDataset(
         dataset,
         horizon=args.task.planner_horizon,
         max_path_length=args.task.max_path_length,
+        jump_steps=jump_steps,
     )
     if args.use_diffusion_invdyn:
         policy_dataset = OGBenchDataset(
             dataset,
             horizon=args.task.planner_horizon,
             max_path_length=args.task.max_path_length,
+            jump_steps=jump_steps,
         )
     else:
         policy_dataset = GCDataset(
@@ -107,11 +112,12 @@ def pipeline(args):
         classifier = GCDistance(nn_classifier, device=args.device, distance_dims=distance_dims)
 
     # ----------------- Masking -------------------
-    fix_mask = torch.zeros((args.task.planner_horizon, obs_dim))
+    model_horizon = (args.task.planner_horizon - 1) // jump_steps + 1
+    fix_mask = torch.zeros((model_horizon, obs_dim))
     fix_mask[0, :obs_dim] = 1.
     if not args.enable_distance_guidance:
         fix_mask[-1, :obs_dim] = 1.  # condition on goal state
-    loss_weight = torch.ones((args.task.planner_horizon, obs_dim))
+    loss_weight = torch.ones((model_horizon, obs_dim))
     # loss_weight[0, obs_dim:] = args.planner_next_obs_loss_weight
 
     # --------------- Diffusion Model --------------------
@@ -237,7 +243,7 @@ def pipeline(args):
                         env=env,
                         normalizer=planner_dataset.get_normalizer(),
                         task_id=task_id,
-                        horizon=args.task.planner_horizon,
+                        horizon=model_horizon,
                         obs_dim=obs_dim,
                         act_dim=act_dim,
                         config=args,
@@ -317,7 +323,7 @@ def pipeline(args):
                 env=env,
                 normalizer=planner_dataset.get_normalizer(),
                 task_id=task_id,
-                horizon=args.task.planner_horizon,
+                horizon=model_horizon,
                 obs_dim=obs_dim,
                 act_dim=act_dim,
                 config=args,
