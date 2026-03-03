@@ -39,7 +39,7 @@ def single_layer_evaluate(
     env,
     normalizer,
     task_id, # The identifier the environment's reset() function expects
-    horizon,
+    horizon, # planning horizon which is reduced by jump_steps
     obs_dim,
     act_dim,
     config, # Your Hydra args object
@@ -52,6 +52,9 @@ def single_layer_evaluate(
     Evaluates the single layer agent(not hierarchical) on a single task.
     """
     assert mode in ['plan_every_step', 'achieve_subgoal'], "Invalid evaluation mode!"
+    if config.adaptive_replan_horizon and mode != 'achieve_subgoal':
+        print("Warning: adaptive_replan_horizon is enabled but mode is not 'achieve_subgoal'. Setting mode to 'achieve_subgoal'.")
+        mode = 'achieve_subgoal'
 
     # Templates for planning priors
     prior_template = torch.zeros((1, horizon, obs_dim), device=config.device)
@@ -82,19 +85,39 @@ def single_layer_evaluate(
         current_plan_observations = None 
         current_subgoal_obs = None   
         current_subgoal_idx_in_plan = -1
+        current_finshed_horizon = 0 # used for adaptive replan horizon
+        temp_plan_valid_horizon = horizon - current_finshed_horizon # Record valid horizon for current plan
 
         while (not episode_done) and (current_episode_step < max_episode_lengths[config.task.env_name]):
             normalized_current_obs = normalizer.normalize(obs[:obs_dim][None])
             normalized_task_goal = normalizer.normalize(task_overall_goal_state[:obs_dim][None]) # [1, obs_dim]
 
             # Planning Step
-            if current_episode_step == 0 or \
-               (config.task.replan_every > 0 and current_episode_step % config.task.replan_every == 0) or \
-                (mode == 'plan_every_step') or (mode == 'achieve_subgoal' and current_subgoal_idx_in_plan >= current_plan_observations.shape[0] -1):
+            need_replan = False
+            # Condition 1: Start
+            if current_episode_step == 0:
+                need_replan = True
+            # Condition 2: Periodic replan
+            elif config.task.replan_every > 0 and current_episode_step % config.task.replan_every == 0:
+                need_replan = True
+            # Condition 3: Plan every step mode
+            elif mode == 'plan_every_step':
+                need_replan = True
+            # Condition 4: Adaptive Replan if deviation from subgoal is too large
+            elif mode == 'achieve_subgoal' and config.get('adaptive_replan_on_error', False) and current_subgoal_obs is not None:
+                dist_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[-goal_dim:])
+
+                # Dynamically determine valid threshold (since max distance varies by env)
+                threshold = config.task.get('replan_error_threshold', 2.0)
+                if dist_to_subgoal > threshold:
+                    print(f"Adaptive Replan Triggered: Deviation {dist_to_subgoal:.4f} > Threshold {threshold}")
+                    need_replan = True
+
+            if need_replan:
                 # Create priors for planning
                 current_prior = prior_template.clone()
                 current_prior[:, 0] = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32)
-                if not config.enable_distance_guidance:
+                if (not config.enable_distance_guidance) and (not config.adaptive_replan_horizon):
                     current_prior[:, -1] = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32)
 
                 # Planning
@@ -105,12 +128,33 @@ def single_layer_evaluate(
                 else:
                     condition_cg = None
                     w_cg = 0.0
-                traj_normalized, _ = diffusions_model.sample(
-                    current_prior.repeat(config.planner_num_candidates, 1, 1),
-                    solver=config.planner_solver, n_samples=config.planner_num_candidates,
-                    sample_steps=config.planner_sampling_steps, use_ema=config.planner_use_ema,
-                    temperature=config.task.planner_temperature, condition_cg=condition_cg, w_cg=w_cg
-                )
+                
+                # Adaptive Replan Horizon Adjustment
+                if config.adaptive_replan_horizon:
+                    adadptive_mask = torch.zeros((1, horizon, obs_dim))
+                    adadptive_mask[0, 0, :] = 1.0 # Always condition on current obs
+                    adadptive_mask[0, horizon - current_finshed_horizon - 1, :] = 1.0
+                    current_prior[:, horizon - current_finshed_horizon - 1] = torch.tensor(normalized_task_goal, device=config.device, dtype=torch.float32)
+
+                    traj_normalized, _ = diffusions_model.sample(
+                        current_prior.repeat(config.planner_num_candidates, 1, 1),
+                        mask=adadptive_mask, repaint_times=10, jump_len=10,
+                        solver='ddpm', n_samples=config.planner_num_candidates,
+                        sample_steps=200, use_ema=config.planner_use_ema,
+                        temperature=config.task.planner_temperature, condition_cg=condition_cg, w_cg=w_cg
+                    )
+
+                else: # Normal fixed horizon mask
+                    traj_normalized, _ = diffusions_model.sample(
+                        current_prior.repeat(config.planner_num_candidates, 1, 1),
+                        solver=config.planner_solver, n_samples=config.planner_num_candidates,
+                        sample_steps=config.planner_sampling_steps, use_ema=config.planner_use_ema,
+                        temperature=config.task.planner_temperature, condition_cg=condition_cg, w_cg=w_cg
+                    )
+
+                temp_plan_valid_horizon = horizon - current_finshed_horizon # Record valid horizon for current plan
+                print(f"Replanning at step {current_episode_step}, valid horizon: {temp_plan_valid_horizon}.")
+
                 # Select the best plan
                 # TODO: N-step Q value estimator
                 idx = 0
@@ -119,7 +163,7 @@ def single_layer_evaluate(
                 jump_steps = config.task.get('jump_steps', 1)
                 plan_lookahead = max(1, config.task.low_horizon // jump_steps)
                 
-                current_subgoal_idx_in_plan = min(plan_lookahead - 1, current_plan_observations.shape[0] - 1)
+                current_subgoal_idx_in_plan = min(plan_lookahead, temp_plan_valid_horizon - 1)
                 current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
             
                 if current_episode_step == 0 and is_video_episode:
@@ -138,18 +182,35 @@ def single_layer_evaluate(
                 if distance_to_subgoal <= config.task.goal_tol: 
                     jump_steps = config.task.get('jump_steps', 1)
                     plan_lookahead = max(1, config.task.low_horizon // jump_steps)
-                    
-                    current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + plan_lookahead, current_plan_observations.shape[0] - 1)
-                    current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
-                    print(f"Subgoal reached, updating to index {current_subgoal_idx_in_plan}.")
+
+                    if current_subgoal_idx_in_plan == temp_plan_valid_horizon - 1:
+                        print(f"Final subgoal reached at index {current_subgoal_idx_in_plan}. (Not finished yet.)")
+                        current_subgoal_idx_in_plan = temp_plan_valid_horizon
+                    else:
+                        # Update finished horizon for adaptive replan
+                        if config.adaptive_replan_horizon:
+                            current_finshed_horizon = min(current_finshed_horizon + plan_lookahead, horizon - 1)
+                            # if current_finshed_horizon == horizon - 1, then the entire task is finished!
+                        
+                        # current_finished_horizon will always be 0 if not adaptive replan
+                        current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + plan_lookahead, temp_plan_valid_horizon-1)
+                        current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
+                        if config.adaptive_replan_horizon:
+                            print(f"Subgoal reached, updated subgoal index to {current_subgoal_idx_in_plan}, finished horizon to {current_finshed_horizon}.")
+                        else:
+                            print(f"Subgoal reached, updating to index {current_subgoal_idx_in_plan}.")
                 
             # Low-Level Control
             if config.use_diffusion_invdyn:
                 policy_prior = torch.zeros((1, act_dim), device=config.device)
                 with torch.no_grad():
                     next_obs_plan = normalizer.normalize(current_subgoal_obs)
-                    obs_policy = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32).unsqueeze(0)
-                    next_obs_policy = torch.tensor(next_obs_plan, device=config.device, dtype=torch.float32).unsqueeze(0)
+                    obs_policy = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32)
+                    next_obs_policy = torch.tensor(next_obs_plan, device=config.device, dtype=torch.float32)
+                    if obs_policy.dim() == 1:
+                        obs_policy = obs_policy.unsqueeze(0)
+                    if next_obs_policy.dim() == 1:
+                        next_obs_policy = next_obs_policy.unsqueeze(0)
                     act, log = low_controller.sample(
                                 policy_prior,
                                 solver=config.policy_solver,
@@ -167,6 +228,8 @@ def single_layer_evaluate(
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             episode_done = info['success']
+            if episode_done:
+                print(f"Episode success after {current_episode_step+1} steps.")
             current_episode_step += 1
 
             # Rendering for video episodes

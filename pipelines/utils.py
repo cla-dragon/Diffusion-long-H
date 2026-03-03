@@ -196,6 +196,8 @@ def visualize_3d_trajectories_wandb(
     cmap_names = ['Blues', 'Oranges', 'Greens', 'Purples']
 
     B, object_num, T, _ = traj.shape
+    if num_points > T:
+        num_points = T
     indices = np.linspace(0, T - 1, num_points)
     indices = np.round(indices).astype(int)
 

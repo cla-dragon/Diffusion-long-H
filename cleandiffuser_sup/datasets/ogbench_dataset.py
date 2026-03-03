@@ -89,8 +89,8 @@ class OGBenchDataset(BaseDataset):
 
         data = {
             'obs': {
-                'state': self.seq_obs[path_idx, start:end+1:self.jump_steps]},
-            'act': self.seq_act[path_idx, start:end+1:self.jump_steps],
+                'state': self.seq_obs[path_idx, start:end:self.jump_steps]},
+            'act': self.seq_act[path_idx, start:end:self.jump_steps],
         }
 
         torch_data = dict_apply(data, torch.tensor)

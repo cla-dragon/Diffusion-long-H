@@ -1,11 +1,11 @@
 defaults:
   - _self_
-  - task: cube-double
+  - task: cube-single
   - low_controller: gciql
 
-pipeline_name: diffuser+gciql_test
-run_alias: subgoal_dis
-mode: inference
+pipeline_name: diffuser+invdyn_adapt # control the results saving path
+run_alias: invdyn_adapt_horizon81_jump5
+mode: train
 seed: 0
 device: cuda:0
 project: Diffusion_OG
@@ -44,13 +44,13 @@ policy_learning_rate: 0.0003
 critic_learning_rate: 0.0003
 
 # Training
-use_diffusion_invdyn: 0
-invdyn_gradient_steps: 800000
-policy_diffusion_gradient_steps: 800000
-planner_diffusion_gradient_steps: 800000
-batch_size: 1024
+use_diffusion_invdyn: 1
+invdyn_gradient_steps: 600000
+policy_diffusion_gradient_steps: 600000
+planner_diffusion_gradient_steps: 600000
+batch_size: 512
 log_interval: 1000
-eval_interval: 5000
+eval_interval: 10000
 save_interval: 100000
 
 # Inference
@@ -59,14 +59,17 @@ num_envs: 1
 planner_num_candidates: 20
 planner_ckpt: latest
 critic_ckpt: 200000
-policy_ckpt: 1000000
+policy_ckpt: latest
 invdyn_ckpt: latest
 planner_use_ema: True
 policy_temperature: 0.5
 policy_use_ema: True
 low_controller_mode: achieve_subgoal # achieve_subgoal or plan_every_step
+adaptive_replan_horizon: true # adaptively adjust replan horizon based on distance to goal
+adaptive_replan_on_error: false # adaptively replan based on state error
 
-num_eval_episodes: 50
+
+num_eval_episodes: 20
 num_video_episodes: 1
 video_frame_skip: 3
 

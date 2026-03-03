@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from cleandiffuser.dataset.dataset_utils import loop_dataloader, loop_two_dataloaders
 from cleandiffuser_sup.classifier import GCDistance
 from cleandiffuser.diffusion import DiscreteDiffusionSDE, ContinuousDiffusionSDE
+from cleandiffuser_sup.diffusion import RepaintContinuousDiffusionSDE
 from cleandiffuser.nn_diffusion import JannerUNet1d, DiT1d, DVInvMlp
 from cleandiffuser.nn_classifier import MLPNNClassifier
 from cleandiffuser.nn_condition import MLPCondition, IdentityCondition
@@ -73,9 +74,9 @@ def pipeline(args):
     if args.use_diffusion_invdyn:
         policy_dataset = OGBenchDataset(
             dataset,
-            horizon=args.task.planner_horizon,
+            horizon=args.task.invdyn_horizon,
             max_path_length=args.task.max_path_length,
-            jump_steps=jump_steps,
+            jump_steps=1,
         )
     else:
         policy_dataset = GCDataset(
@@ -114,17 +115,24 @@ def pipeline(args):
     # ----------------- Masking -------------------
     model_horizon = (args.task.planner_horizon - 1) // jump_steps + 1
     fix_mask = torch.zeros((model_horizon, obs_dim))
-    fix_mask[0, :obs_dim] = 1.
-    if not args.enable_distance_guidance:
+    if not args.adaptive_replan_horizon:
+        fix_mask[0, :obs_dim] = 1.
+    if (not args.enable_distance_guidance) and (not args.adaptive_replan_horizon):
         fix_mask[-1, :obs_dim] = 1.  # condition on goal state
     loss_weight = torch.ones((model_horizon, obs_dim))
     # loss_weight[0, obs_dim:] = args.planner_next_obs_loss_weight
 
     # --------------- Diffusion Model --------------------
-    planner = ContinuousDiffusionSDE(
-        nn_diffusion_planner, nn_condition=None,
-        fix_mask=fix_mask, loss_weight=loss_weight, classifier=classifier, ema_rate=args.planner_ema_rate,
-        device=args.device, predict_noise=args.planner_predict_noise, noise_schedule="linear")
+    if args.adaptive_replan_horizon:
+        planner = RepaintContinuousDiffusionSDE(
+            nn_diffusion_planner, nn_condition=None,
+            fix_mask=fix_mask, loss_weight=loss_weight, classifier=classifier, ema_rate=args.planner_ema_rate,
+            device=args.device, predict_noise=args.planner_predict_noise, noise_schedule="linear")
+    else:
+        planner = ContinuousDiffusionSDE(
+            nn_diffusion_planner, nn_condition=None,
+            fix_mask=fix_mask, loss_weight=loss_weight, classifier=classifier, ema_rate=args.planner_ema_rate,
+            device=args.device, predict_noise=args.planner_predict_noise, noise_schedule="linear")
     
     # ---------------------- Inverse Dynamic (Policy) -----------------------
     if args.use_diffusion_invdyn:
@@ -183,7 +191,8 @@ def pipeline(args):
             if args.use_diffusion_invdyn:
                 policy_horizon_obs = policy_batch["obs"]["state"].to(args.device)
                 policy_horizon_action = policy_batch["act"].to(args.device)
-                policy_td_obs, policy_td_next_obs, policy_td_act = policy_horizon_obs[:,0,:], policy_horizon_obs[:,1,:], policy_horizon_action[:,0,:]
+                invdyn_pick_index = torch.randint(1, args.task.invdyn_horizon, (1,)).item()
+                policy_td_obs, policy_td_next_obs, policy_td_act = policy_horizon_obs[:,0,:], policy_horizon_obs[:,invdyn_pick_index,:], policy_horizon_action[:,0,:]
             elif args.plan_only_object_goal:
                 policy_batch['value_goals'] = policy_batch['value_goals'][:, -goal_dim:]
                 policy_batch['actor_goals'] = policy_batch['actor_goals'][:, -goal_dim:]
