@@ -29,13 +29,36 @@ from cleandiffuser.utils import report_parameters, set_seed
 
 from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from evaluate import single_layer_evaluate
-from pipelines.utils import get_wandb_video, visualize_3d_trajectories_wandb
+from pipelines.utils import get_wandb_video, visualize_3d_trajectories_wandb, resolve_goal_indices
 
 object_num = {
     "cube-single-play-v0": 1,
     "cube-double-play-v0": 2,
     "cube-triple-play-v0": 3,
 }
+
+
+def _stack_3d_trajectories_with_padding(trajectory_list):
+    """Stack list of [object_num, T, 3] arrays into [B, object_num, T_max, 3] via repeat-last padding."""
+    if len(trajectory_list) == 0:
+        return np.zeros((0, 0, 0, 3), dtype=np.float32)
+
+    object_num_val = trajectory_list[0].shape[0]
+    max_t = max(traj.shape[1] for traj in trajectory_list)
+    out = np.zeros((len(trajectory_list), object_num_val, max_t, 3), dtype=np.float32)
+
+    for i, traj in enumerate(trajectory_list):
+        if traj.shape[0] != object_num_val:
+            raise ValueError(
+                f"Inconsistent object_num in trajectory list: expected {object_num_val}, got {traj.shape[0]} at index {i}."
+            )
+
+        t = traj.shape[1]
+        out[i, :, :t, :] = traj.astype(np.float32)
+        if t < max_t:
+            out[i, :, t:, :] = traj[:, -1:, :]
+
+    return out
 
 @hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench", version_base=None)
 def pipeline(args):
@@ -53,8 +76,11 @@ def pipeline(args):
     set_seed(args.seed)
     # TODO: change save_path
     save_path = f'results/{args.pipeline_name}/{args.task.env_name}_H{args.task.planner_horizon}/'
+    lowctrl_save_path = f"results/{args.pipeline_name}/{args.task.env_name}_LOW/"
     if os.path.exists(save_path) is False:
         os.makedirs(save_path)
+    if os.path.exists(lowctrl_save_path) is False:
+        os.makedirs(lowctrl_save_path)
 
     # ---------------------- Create Dataset ----------------------
     env, dataset, _ = ogbench.make_env_and_datasets(
@@ -62,6 +88,9 @@ def pipeline(args):
         compact_dataset=True,
     )
     obs_dim, act_dim = env.observation_space.shape[0], env.action_space.shape[0]
+    goal_indices = resolve_goal_indices(args.task, obs_dim)
+    goal_dim = int(goal_indices.size)
+    goal_idx_tensor = torch.as_tensor(goal_indices, dtype=torch.long)
     
     jump_steps = args.task.get('jump_steps', 1)
     
@@ -148,10 +177,6 @@ def pipeline(args):
             x_min=-1. * torch.ones((1, act_dim), device=args.device),
             diffusion_steps=args.policy_diffusion_steps, ema_rate=args.policy_ema_rate, device=args.device)
     else:
-        if args.plan_only_object_goal:
-            goal_dim = 9 * object_num.get(args.task.env_name, 1)  # only plan for object position
-        else:
-            goal_dim = obs_dim
         invdyn = GCIQLAgent(
             obs_dim=obs_dim,
             action_dim=act_dim,
@@ -159,6 +184,7 @@ def pipeline(args):
             config=args.low_controller,
             device=args.device,
         )
+        print(f"[LowCtrl] goal_dim={goal_dim}, goal_indices={goal_indices.tolist()} (from task.goal_dim)")
     
     # ---------------------- Training ----------------------
     if args.mode == "train":
@@ -193,9 +219,10 @@ def pipeline(args):
                 policy_horizon_action = policy_batch["act"].to(args.device)
                 invdyn_pick_index = torch.randint(1, args.task.invdyn_horizon, (1,)).item()
                 policy_td_obs, policy_td_next_obs, policy_td_act = policy_horizon_obs[:,0,:], policy_horizon_obs[:,invdyn_pick_index,:], policy_horizon_action[:,0,:]
-            elif args.plan_only_object_goal:
-                policy_batch['value_goals'] = policy_batch['value_goals'][:, -goal_dim:]
-                policy_batch['actor_goals'] = policy_batch['actor_goals'][:, -goal_dim:]
+            else:
+                idx = goal_idx_tensor.to(policy_batch["value_goals"].device)
+                policy_batch['value_goals'] = policy_batch['value_goals'].index_select(-1, idx)
+                policy_batch['actor_goals'] = policy_batch['actor_goals'].index_select(-1, idx)
 
             # ----------- Gradient Step ------------
             log["avg_loss_planner"] += planner.update(planner_horizon_data)['loss']
@@ -241,11 +268,12 @@ def pipeline(args):
                 eval_metrics = {}
                 overall_metrics = defaultdict(list)
                 overall_trajectories_3d = []
+                overall_actual_trajectories_3d = []
                 task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
                 num_tasks = len(task_infos)
                 for task_id in trange(1, num_tasks + 1):
                     task_name = task_infos[task_id - 1]['task_name']
-                    eval_info, trajs, cur_renders, trajs_planned_3d = single_layer_evaluate(
+                    eval_info, trajs, cur_renders, trajs_planned_3d, trajs_actual_3d = single_layer_evaluate(
                         diffusions_model=planner,
                         mode=args.low_controller_mode,
                         low_controller=policy if args.use_diffusion_invdyn else invdyn,
@@ -261,7 +289,9 @@ def pipeline(args):
                         video_frame_skip=args.video_frame_skip,
                     )
                     renders.extend(cur_renders)
-                    overall_trajectories_3d.append(trajs_planned_3d[0]) # only log the first vision episode of each task
+                    if args.num_video_episodes > 0 and len(trajs_planned_3d) > 0 and len(trajs_actual_3d) > 0:
+                        overall_trajectories_3d.append(trajs_planned_3d[0]) # only log the first vision episode of each task
+                        overall_actual_trajectories_3d.append(trajs_actual_3d[0]) # only log the first vision episode of each task
                     metric_names = ['success']
                     eval_metrics.update(
                         {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
@@ -273,12 +303,17 @@ def pipeline(args):
                 for k, v in overall_metrics.items():
                     eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
 
-                if args.num_video_episodes > 0:
+                if args.num_video_episodes > 0 and len(overall_trajectories_3d) > 0 and len(overall_actual_trajectories_3d) > 0:
                     video = get_wandb_video(renders=renders, n_cols=num_tasks)
                     eval_metrics['video'] = video
                     # 3D Trajectory Visualization
-                    trajs_planned_3d = np.array(overall_trajectories_3d)  # [B, object_num, T, 3]
-                    trajs_image = visualize_3d_trajectories_wandb(trajs_planned_3d, n_cols=num_tasks)
+                    trajs_planned_3d = _stack_3d_trajectories_with_padding(overall_trajectories_3d)
+                    trajs_actual_3d = _stack_3d_trajectories_with_padding(overall_actual_trajectories_3d)
+                    trajs_image = visualize_3d_trajectories_wandb(
+                        planned_traj=trajs_planned_3d,
+                        actual_traj=trajs_actual_3d,
+                        n_cols=num_tasks,
+                    )
                     eval_metrics['3d_trajectories'] = trajs_image
 
                 wandb.log(eval_metrics, step=n_gradient_step + 1)
@@ -294,11 +329,11 @@ def pipeline(args):
                 planner.save(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{n_gradient_step + 1}.pt"))
                 planner.save(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_latest.pt"))
                 if args.use_diffusion_invdyn:
-                    policy.save(os.path.join(save_path, f"{args.run_alias}_policy_ckpt_{n_gradient_step + 1}.pt"))
-                    policy.save(os.path.join(save_path, f"{args.run_alias}_policy_ckpt_latest.pt"))
+                    policy.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{n_gradient_step + 1}.pt"))
+                    policy.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_latest.pt"))
                 else:
-                    invdyn.save(os.path.join(save_path, f"{args.run_alias}_invdyn_ckpt_{n_gradient_step + 1}.pt"))
-                    invdyn.save(os.path.join(save_path, f"{args.run_alias}_invdyn_ckpt_latest.pt"))
+                    invdyn.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{n_gradient_step + 1}.pt"))
+                    invdyn.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_latest.pt"))
 
 
             n_gradient_step += 1
@@ -311,21 +346,22 @@ def pipeline(args):
         planner.load(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{args.planner_ckpt}.pt"))
         planner.eval()
         if args.use_diffusion_invdyn:
-            policy.load(os.path.join(save_path, f"{args.run_alias}_policy_ckpt_{args.policy_ckpt}.pt"))
+            policy.load(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{args.policy_ckpt}.pt"))
             policy.eval()
         else:
-            invdyn.load(os.path.join(save_path, f"{args.run_alias}_invdyn_ckpt_{args.invdyn_ckpt}.pt"))
+            invdyn.load(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{args.invdyn_ckpt}.pt"))
             invdyn.eval()
 
         renders = []
         eval_metrics = {}
         overall_metrics = defaultdict(list)
         overall_trajectories_3d = []
+        overall_actual_trajectories_3d = []
         task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
         num_tasks = len(task_infos)
         for task_id in trange(1, num_tasks + 1):
             task_name = task_infos[task_id - 1]['task_name']
-            eval_info, trajs, cur_renders, trajs_planned_3d = single_layer_evaluate(
+            eval_info, trajs, cur_renders, trajs_planned_3d, trajs_actual_3d = single_layer_evaluate(
                 diffusions_model=planner,
                 mode=args.low_controller_mode,
                 low_controller=policy if args.use_diffusion_invdyn else invdyn,
@@ -341,7 +377,9 @@ def pipeline(args):
                 video_frame_skip=args.video_frame_skip,
             )
             renders.extend(cur_renders)
-            overall_trajectories_3d.append(trajs_planned_3d[0]) # only log the first vision episode of each task
+            if args.num_video_episodes > 0 and len(trajs_planned_3d) > 0 and len(trajs_actual_3d) > 0:
+                overall_trajectories_3d.append(trajs_planned_3d[0]) # only log the first vision episode of each task
+                overall_actual_trajectories_3d.append(trajs_actual_3d[0]) # only log the first vision episode of each task
             metric_names = ['success']
             eval_metrics.update(
                 {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
@@ -353,12 +391,17 @@ def pipeline(args):
         for k, v in overall_metrics.items():
             eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
 
-        if args.num_video_episodes > 0:
+        if args.num_video_episodes > 0 and len(overall_trajectories_3d) > 0 and len(overall_actual_trajectories_3d) > 0:
             video = get_wandb_video(renders=renders, n_cols=num_tasks)
             eval_metrics['video'] = video
             # 3D Trajectory Visualization
-            trajs_planned_3d = np.array(overall_trajectories_3d)  # [B, object_num, T, 3]
-            trajs_image = visualize_3d_trajectories_wandb(trajs_planned_3d, n_cols=num_tasks)
+            trajs_planned_3d = _stack_3d_trajectories_with_padding(overall_trajectories_3d)
+            trajs_actual_3d = _stack_3d_trajectories_with_padding(overall_actual_trajectories_3d)
+            trajs_image = visualize_3d_trajectories_wandb(
+                planned_traj=trajs_planned_3d,
+                actual_traj=trajs_actual_3d,
+                n_cols=num_tasks,
+            )
             eval_metrics['3d_trajectories'] = trajs_image
 
         wandb.log(eval_metrics, step=1)

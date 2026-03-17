@@ -1,14 +1,14 @@
 defaults:
   - _self_
-  - task: cube-single
-  - low_controller: gciql
+  - task: cube-double
+  - low_controller: gciql # also need to change the 'use_diffusion_invdyn'
 
-pipeline_name: diffuser+invdyn_adapt # control the results saving path
-run_alias: invdyn_adapt_horizon81_jump5
-mode: train
+pipeline_name: diffuser_data # control the results saving path
+run_alias: native
+mode: inference
 seed: 0
 device: cuda:0
-project: Diffusion_OG
+project: Diffusion_OG_New
 group: debug
 # name: diffuser_test
 enable_wandb: true
@@ -31,7 +31,6 @@ planner_predict_noise: True
 planner_next_obs_loss_weight: 1
 planner_ema_rate: 0.995
 unet_dim: 32
-plan_only_object_goal: false  # only plan for object position
 
 ## Policy Config
 policy_solver: ddpm
@@ -44,7 +43,7 @@ policy_learning_rate: 0.0003
 critic_learning_rate: 0.0003
 
 # Training
-use_diffusion_invdyn: 1
+use_diffusion_invdyn: False
 invdyn_gradient_steps: 600000
 policy_diffusion_gradient_steps: 600000
 planner_diffusion_gradient_steps: 600000
@@ -58,7 +57,9 @@ num_envs: 1
 # num_episodes: 20
 planner_num_candidates: 20
 planner_ckpt: latest
-critic_ckpt: 200000
+critic_ckpt: latest
+
+lowctrl_alias: "only_object_goal_xyz"
 policy_ckpt: latest
 invdyn_ckpt: latest
 planner_use_ema: True

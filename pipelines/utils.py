@@ -12,6 +12,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.cm import get_cmap
+from matplotlib.lines import Line2D
 from omegaconf import OmegaConf
 
 from PIL import Image, ImageEnhance
@@ -43,6 +44,36 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def resolve_goal_indices(task_cfg, obs_dim: int) -> np.ndarray:
+    """Resolve task.goal_dim into explicit observation indices.
+
+    Supported formats for task.goal_dim:
+    - int N: use trailing N dims, i.e. [obs_dim-N, ..., obs_dim-1]
+    - list/tuple of indices: explicit dims (supports negative indexing)
+    - missing/None: use all dims [0, ..., obs_dim-1]
+    """
+    goal_spec = task_cfg.get("goal_dim", None)
+    if goal_spec is None:
+        return np.arange(obs_dim, dtype=np.int64)
+
+    if isinstance(goal_spec, (int, np.integer)):
+        if goal_spec <= 0 or goal_spec > obs_dim:
+            raise ValueError(f"Invalid task.goal_dim={goal_spec}, should be in [1, obs_dim={obs_dim}].")
+        return np.arange(obs_dim - int(goal_spec), obs_dim, dtype=np.int64)
+
+    goal_indices = np.asarray(goal_spec, dtype=np.int64).reshape(-1)
+    if goal_indices.size == 0:
+        raise ValueError("task.goal_dim as index list cannot be empty.")
+
+    goal_indices = np.where(goal_indices < 0, goal_indices + obs_dim, goal_indices)
+    if np.any(goal_indices < 0) or np.any(goal_indices >= obs_dim):
+        raise ValueError(f"task.goal_dim contains out-of-range indices for obs_dim={obs_dim}: {goal_indices.tolist()}")
+    if np.unique(goal_indices).size != goal_indices.size:
+        raise ValueError(f"task.goal_dim contains duplicate indices: {goal_indices.tolist()}")
+
+    return goal_indices.astype(np.int64)
 
 
 class Timer:
@@ -168,86 +199,86 @@ def get_wandb_video(renders=None, n_cols=None, fps=15):
     
 
 def visualize_3d_trajectories_wandb(
-    traj: np.ndarray,
+    planned_traj: np.ndarray,
+    actual_traj: Optional[np.ndarray] = None,
     n_cols: Optional[int] = None,
-    cmap_name: str = "viridis",
     figsize_per_plot: float = 4.0,
-    num_points: int = 30,
 ) -> wandb.Image:
     """
     可视化 3D 轨迹，并打包成单张网格图，返回 wandb.Image 方便日志记录。
+    规划轨迹使用虚线，实际轨迹使用实线。
 
     参数:
-        traj: numpy.ndarray, shape [B, object_num, T, 3]
+        planned_traj: numpy.ndarray, shape [B, object_num, T_plan, 3]
             B: batch size
             object_num: 物体数量
-            T: 序列长度
+            T_plan: 规划序列长度
             末维为 (x, y, z)
+        actual_traj: numpy.ndarray, shape [B, object_num, T_actual, 3], 可选
+            实际执行轨迹，若为 None 则仅绘制规划轨迹
         n_cols: 网格列数, 如果为 None 则约取 sqrt(B)
-        cmap_name: 轨迹渐变色的 colormap 名字
         figsize_per_plot: 每个子图的边长（英寸）
 
     返回:
         wandb.Image
     """
-    assert traj.ndim == 4 and traj.shape[-1] == 3, \
-        f"traj shape 必须为 [B, object_num, T, 3]，当前为 {traj.shape}"
-    
-    cmap_names = ['Blues', 'Oranges', 'Greens', 'Purples']
+    assert planned_traj.ndim == 4 and planned_traj.shape[-1] == 3, \
+        f"planned_traj shape 必须为 [B, object_num, T_plan, 3]，当前为 {planned_traj.shape}"
+    if actual_traj is not None:
+        assert actual_traj.ndim == 4 and actual_traj.shape[-1] == 3, \
+            f"actual_traj shape 必须为 [B, object_num, T_actual, 3]，当前为 {actual_traj.shape}"
+        assert actual_traj.shape[0] == planned_traj.shape[0] and actual_traj.shape[1] == planned_traj.shape[1], \
+            "planned_traj 与 actual_traj 的 B/object_num 维度必须一致"
 
-    B, object_num, T, _ = traj.shape
-    if num_points > T:
-        num_points = T
-    indices = np.linspace(0, T - 1, num_points)
-    indices = np.round(indices).astype(int)
+    planned_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+    actual_colors = ['tab:cyan', 'tab:brown', 'tab:olive', 'tab:pink']
+
+    B, object_num, _, _ = planned_traj.shape
 
     if n_cols is None:
         n_cols = int(math.ceil(math.sqrt(B)))
     n_rows = int(math.ceil(B / n_cols))
 
     fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
-    norm = Normalize(vmin=-num_points/4, vmax=num_points - 1)
-
+    legend_handles = []
     for b in range(B):
-        row = b // n_cols
-        col = b % n_cols
         ax = fig.add_subplot(n_rows, n_cols, b + 1, projection="3d")
         ax.set_title(f"Sample {b}", fontsize=8)
 
-        # 对每个 object 画一条轨迹
+        all_xyz = [planned_traj[b].reshape(-1, 3)]
+        if actual_traj is not None:
+            all_xyz.append(actual_traj[b].reshape(-1, 3))
+        all_xyz = np.concatenate(all_xyz, axis=0)
+
+        # 对每个 object 画两条轨迹: 规划(虚线) + 实际(实线)
         for o in range(object_num):
-            cmap = get_cmap(cmap_names[o % len(cmap_names)])  # 使用不同的 colormap
-            traj_o = traj[b, o]  # [T, 3]
-            xs, ys, zs = traj_o[indices, 0], traj_o[indices, 1], traj_o[indices, 2]
+            plan_color = planned_colors[o % len(planned_colors)]
+            real_color = actual_colors[o % len(actual_colors)]
+            plan_o = planned_traj[b, o]
+            ax.plot(plan_o[:, 0], plan_o[:, 1], plan_o[:, 2], linestyle='--', linewidth=1.8, color=plan_color)
+            ax.scatter(plan_o[0, 0], plan_o[0, 1], plan_o[0, 2], marker='o', s=18, color=plan_color)
+            ax.scatter(plan_o[-1, 0], plan_o[-1, 1], plan_o[-1, 2], marker='x', s=30, color=plan_color)
 
-            # 轨迹渐变色散点
-            colors = cmap(norm(np.arange(num_points)))
-            ax.scatter(xs, ys, zs, c=colors, s=20)
+            if actual_traj is not None:
+                real_o = actual_traj[b, o]
+                ax.plot(real_o[:, 0], real_o[:, 1], real_o[:, 2], linestyle='-', linewidth=2.2, color=real_color)
+                ax.scatter(real_o[0, 0], real_o[0, 1], real_o[0, 2], marker='^', s=18, color=real_color)
+                ax.scatter(real_o[-1, 0], real_o[-1, 1], real_o[-1, 2], marker='s', s=18, color=real_color)
 
-            # 初始位置: '+'
-            ax.scatter(
-                xs[0], ys[0], zs[0],
-                c=[cmap(norm(num_points - 1))],
-                marker="+",
-                s=150,
-                linewidths=2,
-            )
-
-            # 最终位置: 'x'
-            ax.scatter(
-                xs[-1], ys[-1], zs[-1],
-                c=[cmap(norm(num_points - 1))],
-                marker="x",
-                s=150,
-                linewidths=2,
-            )
+            if b == 0:
+                legend_handles.append(
+                    Line2D([0], [0], color=plan_color, linestyle='--', linewidth=1.8, label=f"Object {o + 1} Planned")
+                )
+                if actual_traj is not None:
+                    legend_handles.append(
+                        Line2D([0], [0], color=real_color, linestyle='-', linewidth=2.2, label=f"Object {o + 1} Actual")
+                    )
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
 
         # 适当设置相同尺度，避免比例失真
-        all_xyz = traj[b].reshape(-1, 3)
         x_min, y_min, z_min = all_xyz.min(axis=0)
         x_max, y_max, z_max = all_xyz.max(axis=0)
         max_range = max(x_max - x_min, y_max - y_min, z_max - z_min) + 1e-6
@@ -259,7 +290,11 @@ def visualize_3d_trajectories_wandb(
         ax.set_ylim(y_center - half, y_center + half)
         ax.set_zlim(z_center - half, z_center + half)
 
-    plt.tight_layout()
+    if legend_handles:
+        fig.legend(handles=legend_handles, loc='upper center', ncol=max(1, min(len(legend_handles), 4)), fontsize=8)
+        plt.tight_layout(rect=(0, 0, 1, 0.92))
+    else:
+        plt.tight_layout()
 
     # 转成 numpy 图像 (H, W, C) 用于 wandb.Image
     fig.canvas.draw()

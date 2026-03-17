@@ -1,11 +1,13 @@
 env_name: "cube-double-play-v0"
 max_path_length: 1001
 
-planner_horizon: 201
+planner_horizon: 161
 planner_temperature: 1.0
 w_ldg: 0
 
 jump_steps: 10
-low_horizon: 30
-goal_tol: 1.0
+low_horizon: 20
+goal_dim: [19, 20, 21, 28, 29, 30] # None：用全部维度，int：取末尾 N 维（兼容），list/tuple：按显式索引
+goal_tol: 0.6
 replan_every: 200
+replan_error_threshold: 5.0

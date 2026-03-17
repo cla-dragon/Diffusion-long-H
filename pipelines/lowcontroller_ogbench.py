@@ -17,10 +17,10 @@ from cleandiffuser.utils import set_seed
 from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from cleandiffuser_sup.lowcontrol.gciql_inv import GCIQLAgent
 from evaluate import low_controller_evaluate
-from pipelines.utils import get_wandb_video
+from pipelines.utils import get_wandb_video, resolve_goal_indices
 
 
-def draw_value_curves(agent, trajectories, k_goals, device):
+def draw_value_curves(agent, trajectories, k_goals, device, goal_indices=None):
     # trajectories: list of np.ndarray (T, obs_dim)
     # k_goals: int
     
@@ -48,6 +48,8 @@ def draw_value_curves(agent, trajectories, k_goals, device):
             g_idx = goal_indices[j]
             
             goal = traj[g_idx] # (obs_dim,)
+            if goal_indices is not None:
+                goal = goal[goal_indices]
             
             # Prepare inputs for value net
             obs_tensor = torch.from_numpy(traj).to(device).float()
@@ -129,10 +131,14 @@ def pipeline(args):
     )
 
     # ---------------------- Build Low Controller (GCIQL) ----------------------
+    goal_indices = resolve_goal_indices(args.task, obs_dim)
+    goal_dim = int(goal_indices.size)
+    goal_idx_tensor = torch.as_tensor(goal_indices, dtype=torch.long)
+
     invdyn = GCIQLAgent(
         obs_dim=obs_dim,
         action_dim=act_dim,
-        goal_dim=obs_dim,
+        goal_dim=goal_dim,
         config=args.low_controller,
         device=args.device,
     )
@@ -160,6 +166,10 @@ def pipeline(args):
         pbar = tqdm(total=args.invdyn_gradient_steps / args.log_interval)
 
         for batch in loop_dataloader(policy_dataloader):
+            idx = goal_idx_tensor.to(batch["value_goals"].device)
+            batch["value_goals"] = batch["value_goals"].index_select(-1, idx)
+            batch["actor_goals"] = batch["actor_goals"].index_select(-1, idx)
+
             info = invdyn.update(batch)
             log["policy_loss_value"] += info["value/value_loss"]
             log["policy_loss_critic"] += info["critic/critic_loss"]
@@ -211,6 +221,7 @@ def pipeline(args):
                         num_eval_episodes=args.num_eval_episodes,
                         num_video_episodes=args.num_video_episodes,
                         video_frame_skip=args.video_frame_skip,
+                        goal_indices=goal_indices,
                     )
 
                     renders.extend(cur_renders)
@@ -231,7 +242,7 @@ def pipeline(args):
                 
                 # Visualization of value curves
                 if args.enable_wandb:
-                    value_curves_plot = draw_value_curves(invdyn, eval_trajectories, k_goals, args.device)
+                    value_curves_plot = draw_value_curves(invdyn, eval_trajectories, k_goals, args.device, goal_indices=goal_indices)
                     eval_metrics['evaluation/value_curves'] = wandb.Image(value_curves_plot)
 
                 if args.enable_wandb:
@@ -270,6 +281,7 @@ def pipeline(args):
                 num_eval_episodes=args.num_eval_episodes,
                 num_video_episodes=args.num_video_episodes,
                 video_frame_skip=args.video_frame_skip,
+                goal_indices=goal_indices,
             )
 
             renders.extend(cur_renders)

@@ -3,6 +3,7 @@ import torch
 
 from collections import defaultdict
 from tqdm import trange
+from pipelines.utils import resolve_goal_indices
 
 max_episode_lengths = {
     "scene-play-v0": 750,
@@ -58,15 +59,14 @@ def single_layer_evaluate(
 
     # Templates for planning priors
     prior_template = torch.zeros((1, horizon, obs_dim), device=config.device)
-    if config.plan_only_object_goal:
-        goal_dim = 9 * object_num.get(config.task.env_name, 1)
-    else:
-        goal_dim = obs_dim
+    goal_indices = resolve_goal_indices(config.task, obs_dim)
+    goal_dim = int(goal_indices.size)
 
     task_trajectories = []
     task_stats_collector = defaultdict(list)
     task_renders_list = []
     task_trajectories_3d = []
+    task_actual_trajectories_3d = []
 
     for i_episode in trange(num_eval_episodes + num_video_episodes, desc=f"Task {task_id} Episodes", leave=False):
         current_episode_trajectory_data = defaultdict(list)
@@ -87,6 +87,17 @@ def single_layer_evaluate(
         current_subgoal_idx_in_plan = -1
         current_finshed_horizon = 0 # used for adaptive replan horizon
         temp_plan_valid_horizon = horizon - current_finshed_horizon # Record valid horizon for current plan
+        jump_steps = config.task.get('jump_steps', 1)
+        plan_lookahead = max(1, config.task.low_horizon // jump_steps)
+
+        # Record object trajectories for video episodes.
+        current_episode_actual_object_traj = None
+        if is_video_episode:
+            object_num_in_env = object_num.get(config.task.env_name, 1)
+            current_episode_actual_object_traj = [[] for _ in range(object_num_in_env)]
+            for obj_idx in range(object_num_in_env):
+                obj_pos = obs[:obs_dim][-9 * obj_idx - 9:-9 * obj_idx - 6]
+                current_episode_actual_object_traj[obj_idx].append(np.array(obj_pos, copy=True))
 
         while (not episode_done) and (current_episode_step < max_episode_lengths[config.task.env_name]):
             normalized_current_obs = normalizer.normalize(obs[:obs_dim][None])
@@ -105,10 +116,10 @@ def single_layer_evaluate(
                 need_replan = True
             # Condition 4: Adaptive Replan if deviation from subgoal is too large
             elif mode == 'achieve_subgoal' and config.get('adaptive_replan_on_error', False) and current_subgoal_obs is not None:
-                dist_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[-goal_dim:])
+                dist_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[goal_indices])
 
                 # Dynamically determine valid threshold (since max distance varies by env)
-                threshold = config.task.get('replan_error_threshold', 2.0)
+                threshold = config.task.get('replan_error_threshold', 3.0)
                 if dist_to_subgoal > threshold:
                     print(f"Adaptive Replan Triggered: Deviation {dist_to_subgoal:.4f} > Threshold {threshold}")
                     need_replan = True
@@ -160,9 +171,6 @@ def single_layer_evaluate(
                 idx = 0
                 current_plan_observations = normalizer.unnormalize(traj_normalized[idx, :, :].cpu().numpy())
                 
-                jump_steps = config.task.get('jump_steps', 1)
-                plan_lookahead = max(1, config.task.low_horizon // jump_steps)
-                
                 current_subgoal_idx_in_plan = min(plan_lookahead, temp_plan_valid_horizon - 1)
                 current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
             
@@ -178,25 +186,22 @@ def single_layer_evaluate(
             # Subgoal Selection and Update
             elif mode == 'achieve_subgoal':
                 # Update subgoal if reached
-                distance_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[-goal_dim:])
+                distance_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal_obs)[goal_indices])
                 if distance_to_subgoal <= config.task.goal_tol: 
-                    jump_steps = config.task.get('jump_steps', 1)
-                    plan_lookahead = max(1, config.task.low_horizon // jump_steps)
-
                     if current_subgoal_idx_in_plan == temp_plan_valid_horizon - 1:
                         print(f"Final subgoal reached at index {current_subgoal_idx_in_plan}. (Not finished yet.)")
-                        current_subgoal_idx_in_plan = temp_plan_valid_horizon
                     else:
                         # Update finished horizon for adaptive replan
                         if config.adaptive_replan_horizon:
                             current_finshed_horizon = min(current_finshed_horizon + plan_lookahead, horizon - 1)
                             # if current_finshed_horizon == horizon - 1, then the entire task is finished!
+                            # We only update the temp_plan_valid_horizon in replan step!
                         
                         # current_finished_horizon will always be 0 if not adaptive replan
                         current_subgoal_idx_in_plan = min(current_subgoal_idx_in_plan + plan_lookahead, temp_plan_valid_horizon-1)
                         current_subgoal_obs = current_plan_observations[current_subgoal_idx_in_plan, :]
                         if config.adaptive_replan_horizon:
-                            print(f"Subgoal reached, updated subgoal index to {current_subgoal_idx_in_plan}, finished horizon to {current_finshed_horizon}.")
+                            print(f"Subgoal reached, updated subgoal index to {current_subgoal_idx_in_plan}, finished horizon(all progress) to {current_finshed_horizon}.")
                         else:
                             print(f"Subgoal reached, updating to index {current_subgoal_idx_in_plan}.")
                 
@@ -222,15 +227,22 @@ def single_layer_evaluate(
                     action = act.clip(-1., 1.).squeeze().cpu().numpy()
             else:
                 # inverse dynamic
-                normalized_subgoal_obs_for_low = normalizer.normalize(current_subgoal_obs)[-goal_dim:]
+                normalized_subgoal_obs_for_low = normalizer.normalize(current_subgoal_obs)[goal_indices]
                 with torch.no_grad():
                     action = low_controller.predict(normalized_current_obs, normalized_subgoal_obs_for_low).clip(-1., 1.).squeeze().cpu().numpy()
 
+            # Step in the environment
             next_obs, reward, terminated, truncated, info = env.step(action)
             episode_done = info['success']
             if episode_done:
                 print(f"Episode success after {current_episode_step+1} steps.")
             current_episode_step += 1
+
+            # Record actual object trajectories for video episodes
+            if is_video_episode and current_episode_actual_object_traj is not None:
+                for obj_idx in range(len(current_episode_actual_object_traj)):
+                    obj_pos = next_obs[:obs_dim][-9 * obj_idx - 9:-9 * obj_idx - 6]
+                    current_episode_actual_object_traj[obj_idx].append(np.array(obj_pos, copy=True))
 
             # Rendering for video episodes
             if is_video_episode and (current_episode_step % video_frame_skip == 0 or episode_done):
@@ -258,6 +270,14 @@ def single_layer_evaluate(
         else: # Video episode
             if rendered_frames_for_this_episode:
                 task_renders_list.append(np.array(rendered_frames_for_this_episode))
+            if current_episode_actual_object_traj is not None:
+                # Shape: [object_num, T_actual, 3]
+                task_actual_trajectories_3d.append(
+                    np.stack(
+                        [np.stack(points, axis=0) for points in current_episode_actual_object_traj],
+                        axis=0,
+                    )
+                )
 
     # Aggregate statistics for this task
     aggregated_stats_for_this_task = {}
@@ -268,7 +288,13 @@ def single_layer_evaluate(
         elif v_list: # Handle non-numeric summary data if any (e.g. list of strings)
             aggregated_stats_for_this_task[k] = v_list
 
-    return aggregated_stats_for_this_task, task_trajectories, task_renders_list, task_trajectories_3d
+    return (
+        aggregated_stats_for_this_task,
+        task_trajectories,
+        task_renders_list,
+        task_trajectories_3d,
+        task_actual_trajectories_3d,
+    )
 
 
 def low_controller_evaluate(
@@ -282,6 +308,7 @@ def low_controller_evaluate(
     num_eval_episodes,
     num_video_episodes,
     video_frame_skip,
+    goal_indices=None,
 ):
     """Evaluate only a low-level controller on a single OGBench task.
 
@@ -289,6 +316,12 @@ def low_controller_evaluate(
     在 (obs, goal) 条件下选择动作。为了简单起见，我们用环境给出的 overall goal
     作为条件 g：low_controller.predict(obs, goal_state)。
     """
+
+    if goal_indices is None:
+        goal_indices = resolve_goal_indices(config.task, obs_dim)
+    goal_indices = np.asarray(goal_indices, dtype=np.int64).reshape(-1)
+    if goal_indices.size == 0:
+        raise ValueError("goal_indices cannot be empty.")
 
     task_trajectories = []
     task_stats_collector = defaultdict(list)
@@ -311,7 +344,7 @@ def low_controller_evaluate(
         while (not episode_done) and (current_episode_step < max_episode_lengths[config.task.env_name]):
             # 直接用环境给的 final goal 作为条件
             normalized_current_obs = normalizer.normalize(obs[:obs_dim][None])
-            normalized_task_goal = normalizer.normalize(task_overall_goal_state[:obs_dim][None])
+            normalized_task_goal = normalizer.normalize(task_overall_goal_state[:obs_dim][None])[:, goal_indices]
 
             with torch.no_grad():
                 obs_tensor = torch.tensor(normalized_current_obs, device=config.device, dtype=torch.float32).squeeze(0)
