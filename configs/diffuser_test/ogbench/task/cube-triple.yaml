@@ -1,0 +1,14 @@
+env_name: "cube-triple-play-v0"
+max_path_length: 1001
+
+planner_horizon: 241
+multiseg_horizon: 241
+planner_temperature: 1.0
+w_ldg: 0
+
+jump_steps: 10
+low_horizon: 20
+goal_dim: [19, 20, 21, 28, 29, 30, 37, 38, 39]
+goal_tol: 0.8
+replan_every: 200
+replan_error_threshold: 2.5

@@ -200,6 +200,7 @@ def get_wandb_video(renders=None, n_cols=None, fps=15):
 
 def visualize_3d_trajectories_wandb(
     planned_traj: np.ndarray,
+    planned_segment_traj: Optional[np.ndarray] = None,
     actual_traj: Optional[np.ndarray] = None,
     n_cols: Optional[int] = None,
     figsize_per_plot: float = 4.0,
@@ -224,14 +225,20 @@ def visualize_3d_trajectories_wandb(
     """
     assert planned_traj.ndim == 4 and planned_traj.shape[-1] == 3, \
         f"planned_traj shape 必须为 [B, object_num, T_plan, 3]，当前为 {planned_traj.shape}"
+    if planned_segment_traj is not None:
+        assert planned_segment_traj.ndim == 5 and planned_segment_traj.shape[-1] == 3, \
+            f"planned_segment_traj shape 必须为 [B, num_segments, object_num, T_seg, 3]，当前为 {planned_segment_traj.shape}"
+        assert planned_segment_traj.shape[0] == planned_traj.shape[0] and planned_segment_traj.shape[2] == planned_traj.shape[1], \
+            "planned_segment_traj 与 planned_traj 的 B/object_num 维度必须一致"
+
     if actual_traj is not None:
         assert actual_traj.ndim == 4 and actual_traj.shape[-1] == 3, \
             f"actual_traj shape 必须为 [B, object_num, T_actual, 3]，当前为 {actual_traj.shape}"
         assert actual_traj.shape[0] == planned_traj.shape[0] and actual_traj.shape[1] == planned_traj.shape[1], \
             "planned_traj 与 actual_traj 的 B/object_num 维度必须一致"
 
-    planned_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
     actual_colors = ['tab:cyan', 'tab:brown', 'tab:olive', 'tab:pink']
+    segment_cmap = get_cmap("tab10")
 
     B, object_num, _, _ = planned_traj.shape
 
@@ -250,29 +257,50 @@ def visualize_3d_trajectories_wandb(
             all_xyz.append(actual_traj[b].reshape(-1, 3))
         all_xyz = np.concatenate(all_xyz, axis=0)
 
-        # 对每个 object 画两条轨迹: 规划(虚线) + 实际(实线)
-        for o in range(object_num):
-            plan_color = planned_colors[o % len(planned_colors)]
-            real_color = actual_colors[o % len(actual_colors)]
-            plan_o = planned_traj[b, o]
-            ax.plot(plan_o[:, 0], plan_o[:, 1], plan_o[:, 2], linestyle='--', linewidth=1.8, color=plan_color)
-            ax.scatter(plan_o[0, 0], plan_o[0, 1], plan_o[0, 2], marker='o', s=18, color=plan_color)
-            ax.scatter(plan_o[-1, 0], plan_o[-1, 1], plan_o[-1, 2], marker='x', s=30, color=plan_color)
+        if planned_segment_traj is not None and planned_segment_traj.shape[1] > 0:
+            n_segments = planned_segment_traj.shape[1]
+            for s in range(n_segments):
+                seg_color = segment_cmap(s % 10)
+                for o in range(object_num):
+                    seg_o = planned_segment_traj[b, s, o]
+                    ax.plot(seg_o[:, 0], seg_o[:, 1], seg_o[:, 2], linestyle='--', linewidth=2.0, color=seg_color, alpha=0.9)
+                seg_ref = planned_segment_traj[b, s, 0]
+                ax.scatter(seg_ref[0, 0], seg_ref[0, 1], seg_ref[0, 2], marker='o', s=16, color=seg_color)
+                ax.scatter(seg_ref[-1, 0], seg_ref[-1, 1], seg_ref[-1, 2], marker='x', s=24, color=seg_color)
 
-            if actual_traj is not None:
+                if b == 0:
+                    legend_handles.append(
+                        Line2D([0], [0], color=seg_color, linestyle='--', linewidth=2.0, label=f"Planned Segment {s + 1}")
+                    )
+        else:
+            for o in range(object_num):
+                plan_color = segment_cmap(o % 10)
+                plan_o = planned_traj[b, o]
+                ax.plot(plan_o[:, 0], plan_o[:, 1], plan_o[:, 2], linestyle='--', linewidth=1.8, color=plan_color)
+                ax.scatter(plan_o[0, 0], plan_o[0, 1], plan_o[0, 2], marker='o', s=18, color=plan_color)
+                ax.scatter(plan_o[-1, 0], plan_o[-1, 1], plan_o[-1, 2], marker='x', s=30, color=plan_color)
+
+                if b == 0:
+                    legend_handles.append(
+                        Line2D([0], [0], color=plan_color, linestyle='--', linewidth=1.8, label=f"Object {o + 1} Planned")
+                    )
+
+        if actual_traj is not None:
+            for o in range(object_num):
+                real_color = 'black' if planned_segment_traj is not None else actual_colors[o % len(actual_colors)]
                 real_o = actual_traj[b, o]
                 ax.plot(real_o[:, 0], real_o[:, 1], real_o[:, 2], linestyle='-', linewidth=2.2, color=real_color)
                 ax.scatter(real_o[0, 0], real_o[0, 1], real_o[0, 2], marker='^', s=18, color=real_color)
                 ax.scatter(real_o[-1, 0], real_o[-1, 1], real_o[-1, 2], marker='s', s=18, color=real_color)
-
-            if b == 0:
-                legend_handles.append(
-                    Line2D([0], [0], color=plan_color, linestyle='--', linewidth=1.8, label=f"Object {o + 1} Planned")
-                )
-                if actual_traj is not None:
+                if b == 0 and planned_segment_traj is None:
                     legend_handles.append(
                         Line2D([0], [0], color=real_color, linestyle='-', linewidth=2.2, label=f"Object {o + 1} Actual")
                     )
+
+            if b == 0 and planned_segment_traj is not None:
+                legend_handles.append(
+                    Line2D([0], [0], color='black', linestyle='-', linewidth=2.2, label="Actual Trajectory")
+                )
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")

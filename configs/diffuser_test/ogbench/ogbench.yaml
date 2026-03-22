@@ -60,13 +60,14 @@ planner_ckpt: latest
 critic_ckpt: latest
 
 lowctrl_alias: "only_object_goal_xyz"
+lowctrl_load_existing_alias: false
 policy_ckpt: latest
 invdyn_ckpt: latest
 planner_use_ema: True
 policy_temperature: 0.5
 policy_use_ema: True
 low_controller_mode: achieve_subgoal # achieve_subgoal or plan_every_step
-adaptive_replan_horizon: true # adaptively adjust replan horizon based on distance to goal
+adaptive_replan_horizon: false # adaptively adjust replan horizon based on distance to goal
 adaptive_replan_on_error: false # adaptively replan based on state error
 
 

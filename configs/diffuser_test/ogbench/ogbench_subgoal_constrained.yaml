@@ -29,11 +29,11 @@ log_interval: 1000
 eval_interval: 10000
 save_interval: 100000
 
-# Reuse existing low controller
-lowctrl_load_existing: true
+# Low controller policy:
+# - true: load {lowctrl_alias}_lowctrl_ckpt_latest.pt
+# - false: train low controller then save latest
+lowctrl_load_existing_alias: true
 lowctrl_alias: "only_object_goal_xyz"
-lowctrl_load_path: ""
-lowctrl_train_if_missing: true
 
 # Subgoal-constrained planner data filtering
 subgoal:

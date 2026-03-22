@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from cleandiffuser.dataset.dataset_utils import loop_dataloader, loop_two_dataloaders
+from cleandiffuser.dataset.dataset_utils import loop_dataloader
 from cleandiffuser_sup.classifier import GCDistance
 from cleandiffuser.diffusion import DiscreteDiffusionSDE, ContinuousDiffusionSDE
 from cleandiffuser_sup.diffusion import RepaintContinuousDiffusionSDE
@@ -29,6 +29,7 @@ from cleandiffuser.utils import report_parameters, set_seed
 
 from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from evaluate import single_layer_evaluate
+from pipelines.lowcontroller_ogbench import train_low_controller_if_needed, load_low_controller_checkpoint
 from pipelines.utils import get_wandb_video, visualize_3d_trajectories_wandb, resolve_goal_indices
 
 object_num = {
@@ -188,57 +189,47 @@ def pipeline(args):
     
     # ---------------------- Training ----------------------
     if args.mode == "train":
-
         planner_lr_scheduler = CosineAnnealingLR(planner.optimizer, args.planner_diffusion_gradient_steps)
         planner.train()
         # Policy
         if args.use_diffusion_invdyn:
-            policy_lr_scheduler = CosineAnnealingLR(policy.optimizer, args.policy_diffusion_gradient_steps)
-            policy.train()
+            train_low_controller_if_needed(
+                args=args,
+                low_controller=policy,
+                policy_dataloader=policy_dataloader,
+                lowctrl_save_path=lowctrl_save_path,
+                goal_idx_tensor=None,
+                use_diffusion_invdyn=True,
+                log_prefix="warmstart_lowctrl",
+            )
+            policy.eval()
         else:
             # invdyn_lr_scheduler = CosineAnnealingLR(invdyn.optim, args.invdyn_gradient_steps)
             #NOTE GCIQL 不考虑 lr_scheduler
-            invdyn.train()
+            train_low_controller_if_needed(
+                args=args,
+                low_controller=invdyn,
+                policy_dataloader=policy_dataloader,
+                lowctrl_save_path=lowctrl_save_path,
+                goal_idx_tensor=goal_idx_tensor,
+                use_diffusion_invdyn=False,
+                log_prefix="warmstart_lowctrl",
+            )
+            invdyn.eval()
 
         n_gradient_step = 0
-        if args.use_diffusion_invdyn:
-            log = {"gradient_steps": 0, "avg_loss_planner": 0., "bc_loss_policy": 0.}
-        else:
-            log = {"gradient_steps": 0, "avg_loss_planner": 0., 
-                   "policy_loss_value": 0., "policy_loss_critic": 0., "policy_loss_actor": 0.}
-        pbar = tqdm(total=max(args.planner_diffusion_gradient_steps, args.policy_diffusion_gradient_steps)/args.log_interval)
+        log = {"gradient_steps": 0, "avg_loss_planner": 0.}
+        pbar = tqdm(total=max(1, args.planner_diffusion_gradient_steps // args.log_interval))
 
-        for planner_batch, policy_batch in loop_two_dataloaders(planner_dataloader, policy_dataloader):
+        for planner_batch in loop_dataloader(planner_dataloader):
 
             planner_horizon_obs = planner_batch["obs"]["state"].to(args.device)
             planner_horizon_action = planner_batch["act"].to(args.device)
             planner_horizon_data = planner_horizon_obs
 
-            if args.use_diffusion_invdyn:
-                policy_horizon_obs = policy_batch["obs"]["state"].to(args.device)
-                policy_horizon_action = policy_batch["act"].to(args.device)
-                invdyn_pick_index = torch.randint(1, args.task.invdyn_horizon, (1,)).item()
-                policy_td_obs, policy_td_next_obs, policy_td_act = policy_horizon_obs[:,0,:], policy_horizon_obs[:,invdyn_pick_index,:], policy_horizon_action[:,0,:]
-            else:
-                idx = goal_idx_tensor.to(policy_batch["value_goals"].device)
-                policy_batch['value_goals'] = policy_batch['value_goals'].index_select(-1, idx)
-                policy_batch['actor_goals'] = policy_batch['actor_goals'].index_select(-1, idx)
-
             # ----------- Gradient Step ------------
             log["avg_loss_planner"] += planner.update(planner_horizon_data)['loss']
             planner_lr_scheduler.step()
-            if args.use_diffusion_invdyn:
-                # ----------- Policy Gradient Step ------------
-                if n_gradient_step <= args.policy_diffusion_gradient_steps:
-                    log["bc_loss_policy"] += policy.update(policy_td_act, torch.cat([policy_td_obs, policy_td_next_obs], dim=-1))['loss']
-                    policy_lr_scheduler.step()
-            else:    
-                if n_gradient_step <= args.invdyn_gradient_steps:
-                    info = invdyn.update(policy_batch)
-                    log["policy_loss_value"] += info['value/value_loss']
-                    log["policy_loss_critic"] += info['critic/critic_loss']
-                    log["policy_loss_actor"] += info['actor/actor_loss']
-                    # invdyn_lr_scheduler.step()
 
             # ----------- Logging ------------
             if (n_gradient_step + 1) % args.log_interval == 0:
@@ -250,11 +241,7 @@ def pipeline(args):
                 if args.enable_wandb:
                     wandb.log(log, step=n_gradient_step + 1)
                 pbar.update(1)
-                if args.use_diffusion_invdyn:
-                    log = {"gradient_steps": 0, "avg_loss_planner": 0., "bc_loss_policy": 0.}
-                else:
-                    log = {"gradient_steps": 0, "avg_loss_planner": 0., 
-                        "policy_loss_value": 0., "policy_loss_critic": 0., "policy_loss_actor": 0.}
+                log = {"gradient_steps": 0, "avg_loss_planner": 0.}
                     
             # ----------- Evalutation ------------
             if (n_gradient_step) % args.eval_interval == 0:
@@ -319,25 +306,15 @@ def pipeline(args):
                 wandb.log(eval_metrics, step=n_gradient_step + 1)
 
                 planner.train()
-                if args.use_diffusion_invdyn:
-                    policy.train()
-                else:
-                    invdyn.train()
             
             # ----------- Save Model ------------
             if (n_gradient_step + 1) % args.save_interval == 0:
                 planner.save(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{n_gradient_step + 1}.pt"))
                 planner.save(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_latest.pt"))
-                if args.use_diffusion_invdyn:
-                    policy.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{n_gradient_step + 1}.pt"))
-                    policy.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_latest.pt"))
-                else:
-                    invdyn.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{n_gradient_step + 1}.pt"))
-                    invdyn.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_latest.pt"))
 
 
             n_gradient_step += 1
-            if n_gradient_step >= args.planner_diffusion_gradient_steps and n_gradient_step >= args.policy_diffusion_gradient_steps:
+            if n_gradient_step >= args.planner_diffusion_gradient_steps:
                 print(f"===================== Training Finished =====================")
                 break
 
@@ -346,10 +323,20 @@ def pipeline(args):
         planner.load(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{args.planner_ckpt}.pt"))
         planner.eval()
         if args.use_diffusion_invdyn:
-            policy.load(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{args.policy_ckpt}.pt"))
+            load_low_controller_checkpoint(
+                args=args,
+                low_controller=policy,
+                lowctrl_save_path=lowctrl_save_path,
+                use_diffusion_invdyn=True,
+            )
             policy.eval()
         else:
-            invdyn.load(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{args.invdyn_ckpt}.pt"))
+            load_low_controller_checkpoint(
+                args=args,
+                low_controller=invdyn,
+                lowctrl_save_path=lowctrl_save_path,
+                use_diffusion_invdyn=False,
+            )
             invdyn.eval()
 
         renders = []

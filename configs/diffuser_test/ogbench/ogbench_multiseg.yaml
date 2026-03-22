@@ -1,0 +1,88 @@
+defaults:
+  - _self_
+  - task: cube-double
+  - low_controller: gciql
+
+pipeline_name: multiseg_diffuser
+run_alias: multiseg_v1
+mode: train
+seed: 0
+device: cuda:0
+project: Diffusion_OG_New
+group: debug
+enable_wandb: true
+
+# Guidance
+enable_distance_guidance: false
+
+# Planner Config
+planner_solver: ddpm
+planner_emb_dim: 128
+planner_d_model: 256
+planner_depth: 4
+planner_sampling_steps: 50
+planner_predict_noise: true
+planner_ema_rate: 0.995
+planner_num_candidates: 20
+planner_use_ema: true
+planner_ckpt: latest
+
+# Policy Config
+use_diffusion_invdyn: false
+lowctrl_alias: only_object_goal_xyz
+lowctrl_load_existing_alias: true
+invdyn_ckpt: latest
+policy_ckpt: latest
+
+policy_solver: ddpm
+policy_hidden_dim: 256
+policy_diffusion_steps: 10
+policy_sampling_steps: 10
+policy_predict_noise: true
+policy_ema_rate: 0.995
+policy_learning_rate: 0.0003
+policy_use_ema: true
+policy_temperature: 0.5
+
+# Training
+batch_size: 512
+invdyn_gradient_steps: 600000
+policy_diffusion_gradient_steps: 600000
+planner_diffusion_gradient_steps: 600000
+log_interval: 1000
+eval_interval: 10000
+save_interval: 100000
+
+# Train-time mixed conditioning
+training_conditioning:
+  overlap_prob: 0.5
+  inpaint_start_prob: 0.5
+  inpaint_end_prob: 0.5
+
+# Multi-segment sampling (inference/eval)
+multi_segment:
+  segment_horizon: 64
+  overlap_length: 12
+  num_segments: 2 # <=0 means auto-compute from total horizon
+  inner_resample_rounds: 4
+  overlap_blend_type: exp # avg | exp | cosine | linear | smoothstep
+  overlap_exp_beta: 3.0
+  top_n_candidates: 5
+  pick_mode: first # first | rand | score_weighted
+  score_temperature: 5.0
+  repaint_times: 5
+  jump_len: 5 # for repaint
+  w_cg: 0.5
+
+# Evaluation
+low_controller_mode: achieve_subgoal
+num_eval_episodes: 20
+num_video_episodes: 1
+video_frame_skip: 3
+
+adaptive_replan_horizon: false
+adaptive_replan_on_error: false
+
+hydra:
+  job:
+    chdir: false

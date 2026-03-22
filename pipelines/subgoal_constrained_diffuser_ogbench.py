@@ -24,6 +24,7 @@ from cleandiffuser.diffusion import ContinuousDiffusionSDE
 from cleandiffuser_sup.lowcontrol.gciql_inv import GCIQLAgent
 from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
 from evaluate import single_layer_evaluate
+from pipelines.lowcontroller_ogbench import train_low_controller_if_needed, load_low_controller_checkpoint
 from pipelines.utils import get_wandb_video, visualize_3d_trajectories_wandb, resolve_goal_indices
 
 
@@ -306,66 +307,6 @@ def build_soft_sampling_weights(cross_ratios, alpha=6.0, min_weight=0.05):
     return weights.astype(np.float64)
 
 
-def train_low_controller_if_needed(args, invdyn, policy_dataloader, lowctrl_save_path, goal_idx_tensor):
-    ckpt_name = f"{args.lowctrl_alias}_lowctrl_ckpt_latest.pt"
-    default_ckpt_path = os.path.join(lowctrl_save_path, ckpt_name)
-
-    if args.lowctrl_load_existing:
-        load_path = args.lowctrl_load_path if args.lowctrl_load_path else default_ckpt_path
-        if os.path.exists(load_path):
-            print(f"[LowCtrl] Load existing checkpoint: {load_path}")
-            invdyn.load(load_path)
-            return
-        print(f"[LowCtrl] Requested load path not found: {load_path}")
-        if not args.lowctrl_train_if_missing:
-            raise FileNotFoundError(load_path)
-
-    print("[LowCtrl] Start training")
-    invdyn.train()
-    log = {
-        "gradient_steps": 0,
-        "policy_loss_value": 0.0,
-        "policy_loss_critic": 0.0,
-        "policy_loss_actor": 0.0,
-    }
-
-    pbar = tqdm(total=max(1, args.invdyn_gradient_steps // args.log_interval), desc="LowCtrl")
-
-    for n_gradient_step, batch in enumerate(loop_dataloader(policy_dataloader), start=1):
-        idx = goal_idx_tensor.to(batch["value_goals"].device)
-        batch["value_goals"] = batch["value_goals"].index_select(-1, idx)
-        batch["actor_goals"] = batch["actor_goals"].index_select(-1, idx)
-
-        info = invdyn.update(batch)
-        log["policy_loss_value"] += info["value/value_loss"]
-        log["policy_loss_critic"] += info["critic/critic_loss"]
-        log["policy_loss_actor"] += info["actor/actor_loss"]
-
-        if n_gradient_step % args.log_interval == 0:
-            out = {"gradient_steps": n_gradient_step}
-            out.update({k: v / args.log_interval for k, v in log.items() if k != "gradient_steps"})
-            print(out)
-            if args.enable_wandb:
-                wandb.log({f"lowctrl/{k}": v for k, v in out.items()}, step=n_gradient_step)
-            pbar.update(1)
-            log = {
-                "gradient_steps": 0,
-                "policy_loss_value": 0.0,
-                "policy_loss_critic": 0.0,
-                "policy_loss_actor": 0.0,
-            }
-
-        if n_gradient_step % args.save_interval == 0:
-            invdyn.save(os.path.join(lowctrl_save_path, f"{args.lowctrl_alias}_lowctrl_ckpt_{n_gradient_step}.pt"))
-            invdyn.save(default_ckpt_path)
-
-        if n_gradient_step >= args.invdyn_gradient_steps:
-            break
-
-    invdyn.save(default_ckpt_path)
-    print(f"[LowCtrl] Training done. Saved: {default_ckpt_path}")
-
-
 @hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench_subgoal_constrained", version_base=None)
 def pipeline(args):
     args.device = args.device if torch.cuda.is_available() else "cpu"
@@ -432,7 +373,15 @@ def pipeline(args):
 
     if args.mode == "train":
         # Stage 1: train/load low-level value function.
-        train_low_controller_if_needed(args, invdyn, policy_dataloader, lowctrl_save_path, goal_idx_tensor)
+        train_low_controller_if_needed(
+            args=args,
+            low_controller=invdyn,
+            policy_dataloader=policy_dataloader,
+            lowctrl_save_path=lowctrl_save_path,
+            goal_idx_tensor=goal_idx_tensor,
+            use_diffusion_invdyn=False,
+            log_prefix="warmstart_lowctrl",
+        )
         invdyn.eval()
 
         # Stage 2: detect subgoals and filter planner dataset.
@@ -691,7 +640,12 @@ def pipeline(args):
         planner.load(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{args.planner_ckpt}.pt"))
         planner.eval()
 
-        invdyn.load(os.path.join(save_path, f"{args.run_alias}_lowctrl_ckpt_{args.invdyn_ckpt}.pt"))
+        load_low_controller_checkpoint(
+            args=args,
+            low_controller=invdyn,
+            lowctrl_save_path=lowctrl_save_path,
+            use_diffusion_invdyn=False,
+        )
         invdyn.eval()
 
         renders = []
