@@ -1,0 +1,84 @@
+defaults:
+  - _self_
+  - task: cube-double
+  - low_controller: gciql
+
+pipeline_name: segment_stitch
+run_alias: cdgs_like
+mode: inference
+seed: 0
+device: cuda:0
+project: Diffusion_OG_New
+group: debug
+enable_wandb: true
+
+enable_distance_guidance: false
+
+planner_solver: ddim
+planner_sampling_schedule: uniform
+planner_emb_dim: 128
+planner_d_model: 256
+planner_depth: 4
+planner_diffusion_steps: 1000
+planner_sampling_steps: 50
+planner_predict_noise: true
+planner_ema_rate: 0.995
+
+policy_solver: ddpm
+policy_hidden_dim: 256
+policy_diffusion_steps: 10
+policy_sampling_steps: 10
+policy_predict_noise: true
+policy_ema_rate: 0.995
+policy_learning_rate: 0.0003
+critic_learning_rate: 0.0003
+
+use_diffusion_invdyn: false
+invdyn_gradient_steps: 600000
+policy_diffusion_gradient_steps: 600000
+planner_diffusion_gradient_steps: 600000
+batch_size: 512
+log_interval: 1000
+eval_interval: 10000
+save_interval: 100000
+
+planner_num_candidates: 20
+planner_ckpt: latest
+critic_ckpt: latest
+policy_ckpt: latest
+invdyn_ckpt: latest
+planner_use_ema: true
+policy_temperature: 0.5
+policy_use_ema: true
+low_controller_mode: achieve_subgoal
+
+lowctrl_alias: "only_object_goal_xyz"
+lowctrl_load_existing_alias: false
+
+num_eval_episodes: 20
+num_video_episodes: 1
+video_frame_skip: 3
+
+stitch:
+  strategy: interleave
+  segment_model_horizon: 7
+  overlap_steps: 2
+  num_segments: -1
+  top_n: 5
+  pick_mode: first
+  merge_mode: exp
+  merge_beta: 3.0
+  condition_hidden_dim: 256
+  condition_guidance_scale: 2.0
+  gsc_inner_loops: 10
+  gsc_keep_ratio: 0.1
+  gsc_filter_start: 0.94
+  gsc_inversion_ratio: 0.2
+
+training_boundary:
+  overlap_prob: 0.5
+  side_drop_prob: 0.15
+
+hydra:
+  job:
+    chdir: false

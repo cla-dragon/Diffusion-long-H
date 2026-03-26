@@ -13,15 +13,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 
 from cleandiffuser.dataset.dataset_utils import loop_dataloader
-from cleandiffuser.nn_condition import IdentityCondition
-from cleandiffuser.nn_diffusion import DiT1d, DVInvMlp
 from cleandiffuser.diffusion import DiscreteDiffusionSDE
+from cleandiffuser.nn_condition import IdentityCondition
+from cleandiffuser.nn_classifier import MLPNNClassifier
+from cleandiffuser.nn_diffusion import DiT1d, DVInvMlp
 from cleandiffuser.utils import report_parameters, set_seed
-from cleandiffuser_sup.datasets.ogbench_dataset import OGBenchDataset, GCDataset
-from cleandiffuser_sup.diffusion import MultiSegmentRepaintDiffusionSDE
+from cleandiffuser_sup.classifier import GCDistance
+from cleandiffuser_sup.datasets.ogbench_dataset import GCDataset, OGBenchDataset
+from cleandiffuser_sup.diffusion import SegmentStitchDiscreteDiffusionSDE
 from cleandiffuser_sup.lowcontrol.gciql_inv import GCIQLAgent
-from evaluate import multi_segment_evaluate
-from pipelines.lowcontroller_ogbench import train_low_controller_if_needed, load_low_controller_checkpoint
+from cleandiffuser_sup.nn_condition import SegmentBoundaryCondition
+from evaluate import segment_stitch_evaluate
+from pipelines.lowcontroller_ogbench import load_low_controller_checkpoint, train_low_controller_if_needed
 from pipelines.utils import get_wandb_video, resolve_goal_indices, visualize_3d_trajectories_wandb
 
 
@@ -40,54 +43,34 @@ def _stack_3d_trajectories_with_padding(trajectory_list):
     max_t = max(traj.shape[1] for traj in trajectory_list)
     out = np.zeros((len(trajectory_list), object_num_val, max_t, 3), dtype=np.float32)
 
-    for i, traj in enumerate(trajectory_list):
+    for idx, traj in enumerate(trajectory_list):
         t = traj.shape[1]
-        out[i, :, :t, :] = traj.astype(np.float32)
+        out[idx, :, :t, :] = traj.astype(np.float32)
         if t < max_t:
-            out[i, :, t:, :] = traj[:, -1:, :]
+            out[idx, :, t:, :] = traj[:, -1:, :]
 
     return out
 
 
-def _stack_segment_3d_trajectories_with_padding(segment_trajectory_list):
-    if len(segment_trajectory_list) == 0:
-        return np.zeros((0, 0, 0, 0, 3), dtype=np.float32)
-
-    max_seg = max(traj.shape[0] for traj in segment_trajectory_list)
-    object_num_val = segment_trajectory_list[0].shape[1]
-    max_t = max(traj.shape[2] for traj in segment_trajectory_list)
-    out = np.zeros((len(segment_trajectory_list), max_seg, object_num_val, max_t, 3), dtype=np.float32)
-
-    for i, traj in enumerate(segment_trajectory_list):
-        seg_n, _, t, _ = traj.shape
-        out[i, :seg_n, :, :t, :] = traj.astype(np.float32)
-        if t < max_t:
-            out[i, :seg_n, :, t:, :] = traj[:, :, -1:, :]
-        if seg_n < max_seg:
-            out[i, seg_n:, :, :, :] = out[i, seg_n - 1 : seg_n, :, :, :]
-
-    return out
-
-
-@hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench_multiseg", version_base=None)
+@hydra.main(config_path="../configs/diffuser_test/ogbench", config_name="ogbench_segment_stitch", version_base=None)
 def pipeline(args):
     args.device = args.device if torch.cuda.is_available() else "cpu"
-
     if args.enable_wandb and args.mode in ["train", "inference"]:
         wandb.init(
             reinit=True,
             id=str(uuid.uuid4()),
             project=str(args.project),
             group=str(args.group),
-            name=str(args.run_alias) + "_" + str(args.mode),
+            name=f"{args.run_alias}_{args.mode}",
             config=OmegaConf.to_container(args, resolve=True),
         )
 
     set_seed(args.seed)
 
-    planner_horizon_cfg = int(args.task.get("multiseg_horizon", args.task.planner_horizon))
-
-    save_path = f"results/{args.pipeline_name}/{args.task.env_name}_Multi_SegH{planner_horizon_cfg}/"
+    save_path = (
+        f"results/{args.pipeline_name}/"
+        f"{args.task.env_name}_LongH{args.task.planner_horizon}_Seg{args.stitch.segment_model_horizon}/"
+    )
     lowctrl_save_path = f"results/{args.pipeline_name}/{args.task.env_name}_LOW/"
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(lowctrl_save_path, exist_ok=True)
@@ -98,14 +81,17 @@ def pipeline(args):
     goal_dim = int(goal_indices.size)
     goal_idx_tensor = torch.as_tensor(goal_indices, dtype=torch.long)
 
-    jump_steps = args.task.get("jump_steps", 1)
+    jump_steps = int(args.task.get("jump_steps", 1))
+    total_model_horizon = (int(args.task.planner_horizon) - 1) // jump_steps + 1
+    segment_model_horizon = int(args.stitch.segment_model_horizon)
+    segment_raw_horizon = 1 + (segment_model_horizon - 1) * jump_steps
+
     planner_dataset = OGBenchDataset(
         dataset,
-        horizon=planner_horizon_cfg,
+        horizon=segment_raw_horizon,
         max_path_length=args.task.max_path_length,
         jump_steps=jump_steps,
     )
-
     if args.use_diffusion_invdyn:
         policy_dataset = OGBenchDataset(
             dataset,
@@ -146,24 +132,52 @@ def pipeline(args):
         depth=args.planner_depth,
         timestep_emb_type="fourier",
     )
-
+    nn_condition_planner = SegmentBoundaryCondition(
+        obs_dim=obs_dim,
+        overlap_steps=args.stitch.overlap_steps,
+        emb_dim=args.planner_emb_dim,
+        hidden_dim=args.stitch.condition_hidden_dim,
+        dropout=0.0,
+    )
     print("=============== Parameter Report of Planner ==================================")
     report_parameters(nn_diffusion_planner)
+    print("--------------- Condition Encoder --------------------------------------------")
+    report_parameters(nn_condition_planner)
     print("==============================================================================")
 
-    model_horizon = (planner_horizon_cfg - 1) // jump_steps + 1
-    fix_mask = torch.zeros((model_horizon, obs_dim))
-    loss_weight = torch.ones((model_horizon, obs_dim))
+    classifier = None
+    if args.enable_distance_guidance:
+        nn_classifier = MLPNNClassifier(1, 1, 1, [8, 8])
+        distance_dims = []
+        for idx in range(object_num.get(args.task.env_name, 1)):
+            distance_dims.extend(list(range(-9 * idx - 9, -9 * idx - 6)))
+        classifier = GCDistance(
+            nn_classifier,
+            device=args.device,
+            distance_dims=torch.tensor(distance_dims, device=args.device),
+        )
 
-    planner = MultiSegmentRepaintDiffusionSDE(
+    fix_mask = torch.zeros((segment_model_horizon, obs_dim))
+    loss_weight = torch.ones((segment_model_horizon, obs_dim))
+    planner = SegmentStitchDiscreteDiffusionSDE(
         nn_diffusion_planner,
-        nn_condition=None,
+        nn_condition=nn_condition_planner,
         fix_mask=fix_mask,
         loss_weight=loss_weight,
+        classifier=classifier,
+        diffusion_steps=args.planner_diffusion_steps,
         ema_rate=args.planner_ema_rate,
         device=args.device,
         predict_noise=args.planner_predict_noise,
         noise_schedule="linear",
+        overlap_steps=args.stitch.overlap_steps,
+        condition_guidance_scale=args.stitch.condition_guidance_scale,
+        train_overlap_prob=args.training_boundary.overlap_prob,
+        train_side_drop_prob=args.training_boundary.side_drop_prob,
+        gsc_inner_loops=args.stitch.gsc_inner_loops,
+        gsc_keep_ratio=args.stitch.gsc_keep_ratio,
+        gsc_filter_start=args.stitch.gsc_filter_start,
+        gsc_inversion_ratio=args.stitch.gsc_inversion_ratio,
     )
 
     if args.use_diffusion_invdyn:
@@ -210,7 +224,6 @@ def pipeline(args):
                 log_prefix="warmstart_lowctrl",
             )
             policy.eval()
-            log = {"gradient_steps": 0, "avg_loss_planner": 0.0}
         else:
             train_low_controller_if_needed(
                 args=args,
@@ -222,37 +235,25 @@ def pipeline(args):
                 log_prefix="warmstart_lowctrl",
             )
             invdyn.eval()
-            log = {
-                "gradient_steps": 0,
-                "avg_loss_planner": 0.0,
-            }
-
-        pbar = tqdm(total=max(1, args.planner_diffusion_gradient_steps // args.log_interval))
 
         n_gradient_step = 0
+        log = {"gradient_steps": 0, "avg_loss_planner": 0.0}
+        pbar = tqdm(total=max(1, args.planner_diffusion_gradient_steps // args.log_interval))
+
         for planner_batch in loop_dataloader(planner_dataloader):
             planner_horizon_data = planner_batch["obs"]["state"].to(args.device)
-
-            planner_log = planner.update(
-                planner_horizon_data,
-                overlap_length=int(args.multi_segment.overlap_length),
-                overlap_prob=float(args.training_conditioning.overlap_prob),
-                inpaint_start_prob=float(args.training_conditioning.inpaint_start_prob),
-                inpaint_end_prob=float(args.training_conditioning.inpaint_end_prob),
-            )
-            log["avg_loss_planner"] += planner_log["loss"]
+            log["avg_loss_planner"] += planner.update(planner_horizon_data)["loss"]
             planner_lr_scheduler.step()
 
             if (n_gradient_step + 1) % args.log_interval == 0:
                 out = {"gradient_steps": n_gradient_step + 1}
-                for k, v in log.items():
-                    if k != "gradient_steps":
-                        out[k] = v / args.log_interval
+                for key, value in log.items():
+                    if key != "gradient_steps":
+                        out[key] = value / args.log_interval
                 print(out)
                 if args.enable_wandb:
                     wandb.log(out, step=n_gradient_step + 1)
                 pbar.update(1)
-
                 log = {"gradient_steps": 0, "avg_loss_planner": 0.0}
 
             if n_gradient_step % args.eval_interval == 0:
@@ -266,21 +267,19 @@ def pipeline(args):
                 eval_metrics = {}
                 overall_metrics = defaultdict(list)
                 overall_trajectories_3d = []
-                overall_segment_trajectories_3d = []
                 overall_actual_trajectories_3d = []
-
                 task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, "task_infos") else env.task_infos
                 num_tasks = len(task_infos)
                 for task_id in trange(1, num_tasks + 1):
                     task_name = task_infos[task_id - 1]["task_name"]
-                    eval_info, _, cur_renders, trajs_planned_3d, trajs_planned_segments_3d, trajs_actual_3d = multi_segment_evaluate(
+                    eval_info, _, cur_renders, trajs_planned_3d, trajs_actual_3d = segment_stitch_evaluate(
                         diffusions_model=planner,
                         mode=args.low_controller_mode,
                         low_controller=policy if args.use_diffusion_invdyn else invdyn,
                         env=env,
                         normalizer=planner_dataset.get_normalizer(),
                         task_id=task_id,
-                        horizon=model_horizon,
+                        horizon=total_model_horizon,
                         obs_dim=obs_dim,
                         act_dim=act_dim,
                         config=args,
@@ -289,33 +288,33 @@ def pipeline(args):
                         video_frame_skip=args.video_frame_skip,
                     )
                     renders.extend(cur_renders)
-                    if args.num_video_episodes > 0 and len(trajs_planned_3d) > 0 and len(trajs_actual_3d) > 0:
+                    if args.num_video_episodes > 0 and trajs_planned_3d and trajs_actual_3d:
                         overall_trajectories_3d.append(trajs_planned_3d[0])
-                        if len(trajs_planned_segments_3d) > 0:
-                            overall_segment_trajectories_3d.append(trajs_planned_segments_3d[0])
                         overall_actual_trajectories_3d.append(trajs_actual_3d[0])
-                    eval_metrics.update({f"evaluation/{task_name}_success": eval_info.get("success", 0.0)})
-                    overall_metrics["success"].append(eval_info.get("success", 0.0))
+                    metric_names = ["success", "selected_overlap_score", "selected_gsc_score"]
+                    eval_metrics.update(
+                        {f"evaluation/{task_name}_{k}": v for k, v in eval_info.items() if k in metric_names}
+                    )
+                    for key, value in eval_info.items():
+                        if key in metric_names:
+                            overall_metrics[key].append(value)
 
-                eval_metrics["evaluation/overall_success"] = np.mean(overall_metrics["success"])
+                for key, value in overall_metrics.items():
+                    eval_metrics[f"evaluation/overall_{key}"] = float(np.mean(value))
 
-                if args.num_video_episodes > 0 and len(overall_trajectories_3d) > 0 and len(overall_actual_trajectories_3d) > 0:
+                if args.num_video_episodes > 0 and overall_trajectories_3d and overall_actual_trajectories_3d:
                     video = get_wandb_video(renders=renders, n_cols=num_tasks)
                     eval_metrics["video"] = video
                     trajs_planned_3d = _stack_3d_trajectories_with_padding(overall_trajectories_3d)
-                    trajs_planned_segments_3d = _stack_segment_3d_trajectories_with_padding(overall_segment_trajectories_3d)
                     trajs_actual_3d = _stack_3d_trajectories_with_padding(overall_actual_trajectories_3d)
-                    trajs_image = visualize_3d_trajectories_wandb(
+                    eval_metrics["3d_trajectories"] = visualize_3d_trajectories_wandb(
                         planned_traj=trajs_planned_3d,
-                        planned_segment_traj=trajs_planned_segments_3d,
                         actual_traj=trajs_actual_3d,
                         n_cols=num_tasks,
                     )
-                    eval_metrics["3d_trajectories"] = trajs_image
 
                 if args.enable_wandb:
                     wandb.log(eval_metrics, step=n_gradient_step + 1)
-
                 planner.train()
 
             if (n_gradient_step + 1) % args.save_interval == 0:
@@ -324,12 +323,12 @@ def pipeline(args):
 
             n_gradient_step += 1
             if n_gradient_step >= args.planner_diffusion_gradient_steps:
+                print("===================== Training Finished =====================")
                 break
 
     elif args.mode == "inference":
         planner.load(os.path.join(save_path, f"{args.run_alias}_planner_ckpt_{args.planner_ckpt}.pt"))
         planner.eval()
-
         if args.use_diffusion_invdyn:
             load_low_controller_checkpoint(
                 args=args,
@@ -351,21 +350,19 @@ def pipeline(args):
         eval_metrics = {}
         overall_metrics = defaultdict(list)
         overall_trajectories_3d = []
-        overall_segment_trajectories_3d = []
         overall_actual_trajectories_3d = []
-
         task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, "task_infos") else env.task_infos
         num_tasks = len(task_infos)
         for task_id in trange(1, num_tasks + 1):
             task_name = task_infos[task_id - 1]["task_name"]
-            eval_info, _, cur_renders, trajs_planned_3d, trajs_planned_segments_3d, trajs_actual_3d = multi_segment_evaluate(
+            eval_info, _, cur_renders, trajs_planned_3d, trajs_actual_3d = segment_stitch_evaluate(
                 diffusions_model=planner,
                 mode=args.low_controller_mode,
                 low_controller=policy if args.use_diffusion_invdyn else invdyn,
                 env=env,
                 normalizer=planner_dataset.get_normalizer(),
                 task_id=task_id,
-                horizon=model_horizon,
+                horizon=total_model_horizon,
                 obs_dim=obs_dim,
                 act_dim=act_dim,
                 config=args,
@@ -374,32 +371,34 @@ def pipeline(args):
                 video_frame_skip=args.video_frame_skip,
             )
             renders.extend(cur_renders)
-            if args.num_video_episodes > 0 and len(trajs_planned_3d) > 0 and len(trajs_actual_3d) > 0:
+            if args.num_video_episodes > 0 and trajs_planned_3d and trajs_actual_3d:
                 overall_trajectories_3d.append(trajs_planned_3d[0])
-                if len(trajs_planned_segments_3d) > 0:
-                    overall_segment_trajectories_3d.append(trajs_planned_segments_3d[0])
                 overall_actual_trajectories_3d.append(trajs_actual_3d[0])
-            eval_metrics[f"evaluation/{task_name}_success"] = eval_info.get("success", 0.0)
-            overall_metrics["success"].append(eval_info.get("success", 0.0))
+            metric_names = ["success", "selected_overlap_score", "selected_gsc_score"]
+            eval_metrics.update(
+                {f"evaluation/{task_name}_{k}": v for k, v in eval_info.items() if k in metric_names}
+            )
+            for key, value in eval_info.items():
+                if key in metric_names:
+                    overall_metrics[key].append(value)
 
-        eval_metrics["evaluation/overall_success"] = np.mean(overall_metrics["success"])
+        for key, value in overall_metrics.items():
+            eval_metrics[f"evaluation/overall_{key}"] = float(np.mean(value))
 
-        if args.num_video_episodes > 0 and len(overall_trajectories_3d) > 0 and len(overall_actual_trajectories_3d) > 0:
-            video = get_wandb_video(renders=renders, n_cols=num_tasks)
-            eval_metrics["video"] = video
+        if args.num_video_episodes > 0 and overall_trajectories_3d and overall_actual_trajectories_3d:
+            eval_metrics["video"] = get_wandb_video(renders=renders, n_cols=num_tasks)
             trajs_planned_3d = _stack_3d_trajectories_with_padding(overall_trajectories_3d)
-            trajs_planned_segments_3d = _stack_segment_3d_trajectories_with_padding(overall_segment_trajectories_3d)
             trajs_actual_3d = _stack_3d_trajectories_with_padding(overall_actual_trajectories_3d)
-            trajs_image = visualize_3d_trajectories_wandb(
+            eval_metrics["3d_trajectories"] = visualize_3d_trajectories_wandb(
                 planned_traj=trajs_planned_3d,
-                planned_segment_traj=trajs_planned_segments_3d,
                 actual_traj=trajs_actual_3d,
                 n_cols=num_tasks,
             )
-            eval_metrics["3d_trajectories"] = trajs_image
 
         if args.enable_wandb:
             wandb.log(eval_metrics, step=1)
+        else:
+            print(eval_metrics)
 
     else:
         raise ValueError(f"Invalid mode: {args.mode}")

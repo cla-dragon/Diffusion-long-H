@@ -10,38 +10,34 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
         Generate the sequence of time steps for RePaint.
         Returns a list of tuples: (current_step_idx, next_step_idx)
         """
+        if sample_steps < 1:
+            return []
+        if jump_len < 1:
+            raise ValueError("jump_len must be >= 1")
+        if repaint_times < 1:
+            raise ValueError("repaint_times must be >= 1")
+
         schedule = []
         t = sample_steps
-        
+
         while t > 0:
-            # Determine the jump size (cannot go below 0)
-            # steps are 1-based indices in alphas array. 0 is not used for sampling start.
-            curr_jump = min(jump_len, t) # We want to reach t - curr_jump
-            
-            # The exact number of steps to denoise depends on where we stop.
-            # We want to go from t down to t - curr_jump.
-            # If t - curr_jump == 0, we finish.
-            
-            # Repaint Loop
-            for u in range(repaint_times):
-                # 1. Denoise phase: t -> t-1 -> ... -> t - curr_jump
-                for k in range(curr_jump):
-                    curr = t - k
-                    next = t - k - 1
-                    # If next is 0, it means we reached x0 (or final step)
-                    schedule.append((curr, next))
-                
-                # 2. Noise phase (Backtrack): t - curr_jump -> ... -> t
-                # Only if we are not in the last repetition AND not finishing the generation
-                if u < repaint_times - 1 and (t - curr_jump) > 0:
-                    for k in range(curr_jump):
-                        curr = t - curr_jump + k
-                        next = t - curr_jump + k + 1
-                        schedule.append((curr, next))
-            
-            # Advance the main pointer
-            t -= curr_jump
-            
+            curr_jump = min(jump_len, t)
+            next_t = t - curr_jump
+
+            # Once we hit x0, there is no valid forward jump left. Repeating the
+            # last denoise block would apply t->t-1 updates to an x0 state.
+            repeats = repaint_times if next_t > 0 else 1
+
+            for u in range(repeats):
+                for curr in range(t, next_t, -1):
+                    schedule.append((curr, curr - 1))
+
+                if u < repeats - 1:
+                    for curr in range(next_t, t):
+                        schedule.append((curr, curr + 1))
+
+            t = next_t
+
         return schedule
 
     def sample(
@@ -82,6 +78,7 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
         Args:
             mask: Tensor of shape (1, *x_shape) or (n_samples, *x_shape). 
                   1 indicates the pixel is known (from prior), 0 indicates unknown (to be generated).
+                  If not provided, `self.fix_mask` is used when available.
             repaint_times: (U) Number of resampling steps. Recommended: 5~10.
             jump_len: (j) Jump length for resampling. Recommended: 10 (if sample_steps is large enough).
         """
@@ -95,49 +92,26 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
 
         # ===================== Initialization =====================
         prior = prior.to(self.device)
-        # Handle mask
+        repaint_mask = None
         if mask is not None:
-            mask = mask.to(self.device)
-            # Ensure mask is broadcastable
-            if mask.ndim < prior.ndim:
-                mask = mask.unsqueeze(0)
-        
-        # If mask is None but fix_mask is present, we wrap it
-        if mask is None and self.fix_mask is not None:
-             # This is a bit tricky because fix_mask might be 0.
-             pass
+            repaint_mask = mask.to(device=self.device, dtype=prior.dtype)
+        elif isinstance(self.fix_mask, torch.Tensor):
+            repaint_mask = self.fix_mask.to(device=self.device, dtype=prior.dtype)
+
+        if repaint_mask is not None:
+            while repaint_mask.ndim < prior.ndim:
+                repaint_mask = repaint_mask.unsqueeze(0)
 
         log = {
             "sample_history": np.empty((n_samples, sample_steps + 1, *prior.shape)) if preserve_history else None, }
 
         model = self.model if not use_ema else self.model_ema
 
-        # Warm start logic
+        if isinstance(warm_start_reference, torch.Tensor):
+            warm_start_reference = warm_start_reference.to(self.device)
+
         if isinstance(warm_start_reference, torch.Tensor) and warm_start_forward_level > 0.:
             warm_start_forward_level = self.epsilon + warm_start_forward_level * (1. - self.epsilon)
-            fwd_alpha, fwd_sigma = self.noise_schedule_funcs["forward"](
-                torch.ones((1,), device=self.device) * warm_start_forward_level, **(self.noise_schedule_params or {}))
-            xt = warm_start_reference * fwd_alpha + fwd_sigma * torch.randn_like(warm_start_reference)
-        else:
-            xt = torch.randn_like(prior) * temperature
-        
-        # Initial mixing for step T (if mask is present)
-        # Just to be safe, we can mix at the very beginning if it's pure noise, 
-        # but usually the loop handles it.
-        # However, if we start from random noise, the known part is lost. 
-        # We should init known part to noisy prior.
-        if mask is not None:
-            # Init known part
-            # At step T (which is index sample_steps in our schedule logic, but index 0 in history)
-            # We assume alpha_T approx 0.
-            pass
-
-        # If using base class fix_mask logic (when mask is None):
-        if mask is None:
-            xt = xt * (1. - self.fix_mask) + prior * self.fix_mask
-        
-        if preserve_history:
-            log["sample_history"][:, 0] = xt.cpu().numpy()
 
         with torch.set_grad_enabled(requires_grad):
             condition_vec_cfg = model["condition"](condition_cfg, mask_cfg) if condition_cfg is not None else None
@@ -148,7 +122,7 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
             t_diffusion = [self.t_diffusion[0], warm_start_forward_level]
         else:
             t_diffusion = self.t_diffusion
-        
+
         if isinstance(sample_step_schedule, str):
             if sample_step_schedule in SUPPORTED_SAMPLING_STEP_SCHEDULE.keys():
                 sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE[sample_step_schedule](
@@ -170,6 +144,29 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
         stds[1:] = sigmas[:-1] / sigmas[1:] * (1 - (alphas[1:] / alphas[:-1]) ** 2).sqrt()
 
         buffer = []
+
+        def mix_known_region(x: torch.Tensor, step_idx: int) -> torch.Tensor:
+            if repaint_mask is None:
+                return x
+
+            if step_idx > 0:
+                xt_known = alphas[step_idx] * prior + sigmas[step_idx] * torch.randn_like(prior)
+            else:
+                xt_known = prior
+
+            return repaint_mask * xt_known + (1. - repaint_mask) * x
+
+        # Warm start logic
+        if isinstance(warm_start_reference, torch.Tensor) and warm_start_forward_level > 0.:
+            xt = warm_start_reference * alphas[sample_steps] + sigmas[sample_steps] * torch.randn_like(warm_start_reference)
+        else:
+            xt = torch.randn_like(prior) * temperature
+
+        # RePaint requires the known region to start from the correct noised prior.
+        xt = mix_known_region(xt, sample_steps)
+
+        if preserve_history:
+            log["sample_history"][:, 0] = xt.cpu().numpy()
 
         # ===================== Denoising Loop ========================
         # Generate the RePaint schedule
@@ -229,20 +226,7 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
                      # Or just execute DDIM logic
                      xt = (alphas[next_i] * ((xt - sigmas[i] * eps_theta) / alphas[i]) + sigmas[next_i] * eps_theta)
 
-                # Apply Mask Mixing (Crucial Step)
-                if mask is not None:
-                    # Sample noise for the known part at level next_i
-                    if next_i > 0:
-                        noise = torch.randn_like(prior)
-                        xt_known = alphas[next_i] * prior + sigmas[next_i] * noise
-                    else:
-                        xt_known = prior
-                    
-                    xt = mask * xt_known + (1. - mask) * xt
-                
-                # Base class fix mask
-                elif mask is None and self.fix_mask is not None:
-                    xt = xt * (1. - self.fix_mask) + prior * self.fix_mask
+                xt = mix_known_region(xt, next_i)
 
             # ---------------- Case 2: Diffuse (Forward / Backtrack) ----------------
             elif i < next_i:
@@ -256,9 +240,7 @@ class RepaintContinuousDiffusionSDE(ContinuousDiffusionSDE):
                 sigma_rel = (sigmas[next_i]**2 - coef**2 * sigmas[i]**2).clamp(min=0).sqrt()
                 
                 xt = coef * xt + sigma_rel * torch.randn_like(xt)
-                
-                # No mask mixing needed here strictly, but you could mix if you want strict adherence to known x_{next}.
-                # But x_{next} (the higher noise level) will be fixed in the subsequent Denoise step anyway.
+                xt = mix_known_region(xt, next_i)
             
             # ---------------- Logging ----------------
             if preserve_history:

@@ -1,2 +1,2 @@
 from .base import *
-from .multiseg import *
+from .segment_stitch import *
