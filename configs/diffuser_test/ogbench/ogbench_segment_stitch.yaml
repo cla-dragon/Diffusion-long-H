@@ -3,9 +3,9 @@ defaults:
   - task: cube-double
   - low_controller: gciql
 
-pipeline_name: segment_stitch
-run_alias: cdgs_like
-mode: inference
+pipeline_name: multiseg_diffuser
+run_alias: gsc_jump1
+mode: train
 seed: 0
 device: cuda:0
 project: Diffusion_OG_New
@@ -51,19 +51,41 @@ planner_use_ema: true
 policy_temperature: 0.5
 policy_use_ema: true
 low_controller_mode: achieve_subgoal
+adaptive_replan_horizon: false # for segment_stitch, reduce num_segments with progress instead of shrinking token-level horizon
+adaptive_replan_on_error: false # keep separated for ablation, same meaning as other ogbench evaluate configs
 
 lowctrl_alias: "only_object_goal_xyz"
-lowctrl_load_existing_alias: false
+lowctrl_load_existing_alias: true
+
+subgoal_filter:
+  enable: false # requires use_diffusion_invdyn: false; filtering relies on the GCIQL value function
+  k_goals: 20
+  c_lookback: 6.0
+  min_traj_length: 20
+  min_subgoal_dist: 30
+  max_subgoals_per_traj: 16
+  max_cross_ratio: 0.25
+  min_keep_ratio: 0.3
+  sampling:
+    strategy: hard # hard | soft
+    soft_alpha: 6.0
+    soft_min_weight: 0.05
+  analysis:
+    max_detail_rows: 1000
+    table_sample_seed: 0
+    histogram_bins_cross_ratio: 50
+    histogram_bins_subgoal_count: 20
+    histogram_bins_soft_weight: 50
 
 num_eval_episodes: 20
 num_video_episodes: 1
 video_frame_skip: 3
 
 stitch:
-  strategy: interleave
-  segment_model_horizon: 7
-  overlap_steps: 2
-  num_segments: -1
+  strategy: gsc
+  segment_model_horizon: 90
+  overlap_steps: 20
+  num_segments: 2
   top_n: 5
   pick_mode: first
   merge_mode: exp

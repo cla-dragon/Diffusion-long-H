@@ -348,6 +348,7 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
         temperature: float = 1.0,
         condition_cg=None,
         w_cg: float = 0.0,
+        overlap_score_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], Dict[str, torch.Tensor]]:
         model = self.model_ema if use_ema else self.model
         start_state = start_state.to(self.device)
@@ -430,7 +431,11 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
 
         segments[0] = self._apply_anchor(segments[0], start_state=start_state)
         segments[-1] = self._apply_anchor(segments[-1], goal_state=goal_state)
-        return segments, {}
+        overlap_scores = self._compute_overlap_mismatch_scores(segments, scale=overlap_score_scale)
+        order = torch.argsort(overlap_scores)
+        segments = [segment[order] for segment in segments]
+        overlap_scores = overlap_scores[order].detach().cpu().numpy()
+        return segments, {"candidate_scores": overlap_scores, "score_kind": "overlap_mismatch"}
 
     def _average_overlap_in_place(self, segments: List[torch.Tensor]) -> None:
         for idx in range(1, len(segments)):
@@ -439,6 +444,26 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
             fused = 0.5 * (left + right)
             segments[idx - 1][:, -self.overlap_steps :, :] = fused
             segments[idx][:, : self.overlap_steps, :] = fused
+
+    def _compute_overlap_mismatch_scores(
+        self,
+        segments: List[torch.Tensor],
+        scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if len(segments) <= 1:
+            return torch.zeros((segments[0].shape[0],), device=segments[0].device, dtype=segments[0].dtype)
+
+        scaled = None
+        if scale is not None:
+            scaled = scale.to(device=segments[0].device, dtype=segments[0].dtype).reshape(1, 1, -1)
+
+        pairwise = []
+        for idx in range(len(segments) - 1):
+            diff = segments[idx][:, -self.overlap_steps :, :] - segments[idx + 1][:, : self.overlap_steps, :]
+            if scaled is not None:
+                diff = diff * scaled
+            pairwise.append((diff ** 2).mean(dim=(1, 2)))
+        return torch.stack(pairwise, dim=1).sum(dim=1)
 
     def _compute_inversion_score(
         self,
@@ -482,12 +507,6 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
         derivative = torch.diff(noise_path, dim=1)
         return torch.linalg.vector_norm(derivative.reshape(x.shape[0], -1), dim=1)
 
-    def _repeat_selected(self, tensor: torch.Tensor, indices: torch.Tensor, total: int) -> torch.Tensor:
-        selected = tensor[indices]
-        while selected.shape[0] < total:
-            selected = torch.cat([selected, selected], dim=0)
-        return selected[:total]
-
     def sample_gsc_segments(
         self,
         start_state: torch.Tensor,
@@ -514,6 +533,7 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
             for _ in range(num_segments)
         ]
         self.latest_gsc_scores = None
+        latest_score_stack = None
 
         late_window = int(math.ceil((1.0 - self.gsc_filter_start) * sample_steps))
         late_window = min(max(late_window, 1), sample_steps)
@@ -577,19 +597,22 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
                     inversion_scores = current_scores
 
             if inversion_scores is not None:
-                score_stack = torch.stack(inversion_scores, dim=1)
-                mean_score = score_stack.mean(dim=1)
-                keep_count = max(1, int(self.gsc_keep_ratio * mean_score.shape[0]))
-                chosen = torch.argsort(mean_score)[:keep_count]
-
-                segments = [self._repeat_selected(seg, chosen, batch_size) for seg in segments]
-                score_stack = self._repeat_selected(score_stack, chosen, batch_size)
-                self.latest_gsc_scores = [score_stack[:, idx].detach().cpu().numpy() for idx in range(score_stack.shape[1])]
+                latest_score_stack = torch.stack(inversion_scores, dim=1)
 
         self._average_overlap_in_place(segments)
         segments[0] = self._apply_anchor(segments[0], start_state=start_state)
         segments[-1] = self._apply_anchor(segments[-1], goal_state=goal_state)
-        return segments, {"gsc_scores": self.latest_gsc_scores}
+        candidate_scores = None
+        if latest_score_stack is not None:
+            mean_score = latest_score_stack.mean(dim=1)
+            order = torch.argsort(mean_score)
+            segments = [segment[order] for segment in segments]
+            latest_score_stack = latest_score_stack[order]
+            self.latest_gsc_scores = [
+                latest_score_stack[:, idx].detach().cpu().numpy() for idx in range(latest_score_stack.shape[1])
+            ]
+            candidate_scores = mean_score[order].detach().cpu().numpy()
+        return segments, {"gsc_scores": self.latest_gsc_scores, "candidate_scores": candidate_scores, "score_kind": "gsc"}
 
     def sample_segment_chain(
         self,
@@ -604,6 +627,7 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
         temperature: float = 1.0,
         condition_cg=None,
         w_cg: float = 0.0,
+        overlap_score_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], Dict[str, torch.Tensor]]:
         strategy = str(strategy).lower()
         if strategy == "interleave":
@@ -618,6 +642,7 @@ class SegmentStitchDiscreteDiffusionSDE(DiscreteDiffusionSDE):
                 temperature=temperature,
                 condition_cg=condition_cg,
                 w_cg=w_cg,
+                overlap_score_scale=overlap_score_scale,
             )
         if strategy == "gsc":
             return self.sample_gsc_segments(

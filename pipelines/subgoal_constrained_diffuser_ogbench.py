@@ -131,14 +131,23 @@ def detect_subgoals_for_all_trajectories(
                 values_smooth = values
 
             val_range = np.max(values_smooth) - np.min(values_smooth) + 1e-6
-            prominence = 0.05 * val_range
-            peaks, _ = find_peaks(-values_smooth, prominence=prominence, distance=3)
+            prominence = 0.1 * val_range
+            peaks, _ = find_peaks(-values_smooth, prominence=prominence, distance=5)
 
             for p in peaks:
                 subgoal_votes[indices[p]] += 1
 
         vote_density = np.convolve(subgoal_votes, np.ones(10), mode="same")
-        final_peaks, _ = find_peaks(vote_density, height=0.5, distance=min_subgoal_dist)
+        # Use an opportunity-aware threshold so boundary timesteps (with fewer voting chances)
+        # are not unfairly suppressed during peak detection.
+        opportunity_density = np.convolve(opportunity_counts, np.ones(10), mode="same")
+        max_opportunity = float(np.max(opportunity_density))
+        if max_opportunity > 0.0:
+            opportunity_scale = opportunity_density / max_opportunity
+        else:
+            opportunity_scale = np.ones_like(opportunity_density, dtype=np.float32)
+        adaptive_height = 0.5 * np.clip(opportunity_scale, 0.35, 1.0)
+        final_peaks, _ = find_peaks(vote_density, height=adaptive_height, distance=min_subgoal_dist)
 
         if len(final_peaks) > max_subgoals_per_traj:
             # Normalize by local "opportunity" counts to avoid unfairly penalizing boundary timesteps.
@@ -384,103 +393,118 @@ def pipeline(args):
         )
         invdyn.eval()
 
-        # Stage 2: detect subgoals and filter planner dataset.
-        trajs = _get_trajectory_obs_list(planner_dataset)
-        subgoal_results = detect_subgoals_for_all_trajectories(
-            invdyn,
-            trajectories=trajs,
-            goal_indices=goal_indices,
-            k_goals=args.subgoal.k_goals,
-            c_lookback=args.subgoal.c_lookback,
-            device=args.device,
-            min_traj_length=args.subgoal.min_traj_length,
-            min_subgoal_dist=args.subgoal.min_subgoal_dist,
-            max_subgoals_per_traj=args.subgoal.max_subgoals_per_traj,
-        )
+        # Stage 2: optionally detect subgoals and filter planner dataset.
+        subgoal_enabled = bool(args.subgoal.get("enabled", True))
+        print(f"[PlannerData] subgoal.enabled={subgoal_enabled}")
 
-        kept_indices, removed, cross_ratios = build_subgoal_filtered_indices(
-            planner_dataset,
-            subgoal_results,
-            horizon=args.task.planner_horizon,
-            max_cross_ratio=args.subgoal.max_cross_ratio,
-        )
+        if subgoal_enabled:
+            trajs = _get_trajectory_obs_list(planner_dataset)
+            subgoal_results = detect_subgoals_for_all_trajectories(
+                invdyn,
+                trajectories=trajs,
+                goal_indices=goal_indices,
+                k_goals=args.subgoal.k_goals,
+                c_lookback=args.subgoal.c_lookback,
+                device=args.device,
+                min_traj_length=args.subgoal.min_traj_length,
+                min_subgoal_dist=args.subgoal.min_subgoal_dist,
+                max_subgoals_per_traj=args.subgoal.max_subgoals_per_traj,
+            )
 
-        subgoal_counts = np.array([len(x["valid_subgoals"]) for x in subgoal_results], dtype=np.float32)
-        _save_subgoal_analysis_summary_json(
-            subgoal_results=subgoal_results,
-            cross_ratios=cross_ratios,
-            cross_ratio_threshold=args.subgoal.max_cross_ratio,
-            output_path=os.path.join(analysis_log_dir, "subgoal_filter_summary.json"),
-        )
-        _save_histogram_png_and_json(
-            cross_ratios,
-            output_prefix=os.path.join(analysis_log_dir, "cross_ratio_hist"),
-            bins=args.subgoal.analysis.histogram_bins_cross_ratio,
-            hist_range=(0.0, 1.0),
-            title="Cross Ratio Histogram",
-        )
-        _save_histogram_png_and_json(
-            subgoal_counts,
-            output_prefix=os.path.join(analysis_log_dir, "subgoal_count_hist"),
-            bins=args.subgoal.analysis.histogram_bins_subgoal_count,
-            title="Subgoal Count Histogram",
-        )
-        print(f"[SubgoalAnalysis] Saved local artifacts to: {analysis_log_dir}")
+            kept_indices, removed, cross_ratios = build_subgoal_filtered_indices(
+                planner_dataset,
+                subgoal_results,
+                horizon=args.task.planner_horizon,
+                max_cross_ratio=args.subgoal.max_cross_ratio,
+            )
 
-        keep_ratio = len(kept_indices) / max(1, len(planner_dataset))
-        print(
-            f"[PlannerData] keep={len(kept_indices)} / total={len(planner_dataset)} "
-            f"(keep_ratio={keep_ratio:.4f}), removed={removed}"
-        )
+            subgoal_counts = np.array([len(x["valid_subgoals"]) for x in subgoal_results], dtype=np.float32)
+            _save_subgoal_analysis_summary_json(
+                subgoal_results=subgoal_results,
+                cross_ratios=cross_ratios,
+                cross_ratio_threshold=args.subgoal.max_cross_ratio,
+                output_path=os.path.join(analysis_log_dir, "subgoal_filter_summary.json"),
+            )
+            _save_histogram_png_and_json(
+                cross_ratios,
+                output_prefix=os.path.join(analysis_log_dir, "cross_ratio_hist"),
+                bins=args.subgoal.analysis.histogram_bins_cross_ratio,
+                hist_range=(0.0, 1.0),
+                title="Cross Ratio Histogram",
+            )
+            _save_histogram_png_and_json(
+                subgoal_counts,
+                output_prefix=os.path.join(analysis_log_dir, "subgoal_count_hist"),
+                bins=args.subgoal.analysis.histogram_bins_subgoal_count,
+                title="Subgoal Count Histogram",
+            )
+            print(f"[SubgoalAnalysis] Saved local artifacts to: {analysis_log_dir}")
 
-        sampling_strategy = args.subgoal.sampling.strategy
-        print(f"[PlannerData] sampling_strategy={sampling_strategy}")
+            keep_ratio = len(kept_indices) / max(1, len(planner_dataset))
+            print(
+                f"[PlannerData] keep={len(kept_indices)} / total={len(planner_dataset)} "
+                f"(keep_ratio={keep_ratio:.4f}), removed={removed}"
+            )
 
-        if sampling_strategy == "hard":
-            if keep_ratio < args.subgoal.min_keep_ratio:
-                raise ValueError(
-                    f"Filtered samples too few: keep_ratio={keep_ratio:.4f} < min_keep_ratio={args.subgoal.min_keep_ratio}. "
-                    "Please relax max_cross_ratio or subgoal params."
+            sampling_strategy = args.subgoal.sampling.strategy
+            print(f"[PlannerData] sampling_strategy={sampling_strategy}")
+
+            if sampling_strategy == "hard":
+                if keep_ratio < args.subgoal.min_keep_ratio:
+                    raise ValueError(
+                        f"Filtered samples too few: keep_ratio={keep_ratio:.4f} < min_keep_ratio={args.subgoal.min_keep_ratio}. "
+                        "Please relax max_cross_ratio or subgoal params."
+                    )
+
+                filtered_planner_dataset = Subset(planner_dataset, kept_indices)
+                planner_dataloader = DataLoader(
+                    filtered_planner_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    pin_memory=True,
+                    drop_last=True,
                 )
 
-            filtered_planner_dataset = Subset(planner_dataset, kept_indices)
+            elif sampling_strategy == "soft":
+                soft_weights = build_soft_sampling_weights(
+                    cross_ratios,
+                    alpha=args.subgoal.sampling.soft_alpha,
+                    min_weight=args.subgoal.sampling.soft_min_weight,
+                )
+                sampler = WeightedRandomSampler(
+                    weights=torch.from_numpy(soft_weights),
+                    num_samples=len(soft_weights),
+                    replacement=True,
+                )
+                planner_dataloader = DataLoader(
+                    planner_dataset,
+                    batch_size=args.batch_size,
+                    sampler=sampler,
+                    num_workers=4,
+                    pin_memory=True,
+                    drop_last=True,
+                )
+                _save_histogram_png_and_json(
+                    soft_weights,
+                    output_prefix=os.path.join(analysis_log_dir, "soft_weight_hist"),
+                    bins=args.subgoal.analysis.histogram_bins_soft_weight,
+                    hist_range=(0.0, 1.0),
+                    title="Soft Sampling Weight Histogram",
+                )
+            else:
+                raise ValueError(f"Invalid subgoal.sampling.strategy: {sampling_strategy}")
+
+        else:
+            print("[PlannerData] Subgoal constraint disabled, training with full planner dataset.")
             planner_dataloader = DataLoader(
-                filtered_planner_dataset,
+                planner_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
                 num_workers=4,
                 pin_memory=True,
                 drop_last=True,
             )
-
-        elif sampling_strategy == "soft":
-            soft_weights = build_soft_sampling_weights(
-                cross_ratios,
-                alpha=args.subgoal.sampling.soft_alpha,
-                min_weight=args.subgoal.sampling.soft_min_weight,
-            )
-            sampler = WeightedRandomSampler(
-                weights=torch.from_numpy(soft_weights),
-                num_samples=len(soft_weights),
-                replacement=True,
-            )
-            planner_dataloader = DataLoader(
-                planner_dataset,
-                batch_size=args.batch_size,
-                sampler=sampler,
-                num_workers=4,
-                pin_memory=True,
-                drop_last=True,
-            )
-            _save_histogram_png_and_json(
-                soft_weights,
-                output_prefix=os.path.join(analysis_log_dir, "soft_weight_hist"),
-                bins=args.subgoal.analysis.histogram_bins_soft_weight,
-                hist_range=(0.0, 1.0),
-                title="Soft Sampling Weight Histogram",
-            )
-        else:
-            raise ValueError(f"Invalid subgoal.sampling.strategy: {sampling_strategy}")
 
         # Stage 3: train diffusion planner on filtered samples.
         nn_diffusion_planner = DiT1d(

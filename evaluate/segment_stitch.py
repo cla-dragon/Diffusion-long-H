@@ -19,6 +19,20 @@ def _resolve_num_segments(total_horizon, segment_horizon, overlap_steps, configu
     return int(math.ceil((total_horizon - segment_horizon) / stride) + 1)
 
 
+def _segment_chain_horizon(num_segments, segment_horizon, overlap_steps):
+    stride = max(1, segment_horizon - overlap_steps)
+    return int(segment_horizon + max(0, num_segments - 1) * stride)
+
+
+def _resolve_adaptive_num_segments(initial_num_segments, completed_horizon, segment_horizon, overlap_steps):
+    stride = max(1, segment_horizon - overlap_steps)
+    completed_segments = min(
+        max(0, int(completed_horizon) // stride),
+        max(0, int(initial_num_segments) - 1),
+    )
+    return max(1, int(initial_num_segments) - completed_segments)
+
+
 def segment_stitch_evaluate(
     diffusions_model,
     mode,
@@ -35,22 +49,37 @@ def segment_stitch_evaluate(
     video_frame_skip,
 ):
     assert mode in ["plan_every_step", "achieve_subgoal"], "Invalid evaluation mode!"
+    if config.get("adaptive_replan_horizon", False) and mode != "achieve_subgoal":
+        print(
+            "Warning: adaptive_replan_horizon is enabled but mode is not 'achieve_subgoal'. "
+            "Setting mode to 'achieve_subgoal'."
+        )
+        mode = "achieve_subgoal"
 
     stitch_cfg = config.stitch
     segment_horizon = int(stitch_cfg.segment_model_horizon)
     overlap_steps = int(stitch_cfg.overlap_steps)
-    num_segments = _resolve_num_segments(
+    initial_num_segments = _resolve_num_segments(
         total_horizon=horizon,
         segment_horizon=segment_horizon,
         overlap_steps=overlap_steps,
         configured_num_segments=stitch_cfg.get("num_segments", None),
     )
     goal_indices = resolve_goal_indices(config.task, obs_dim)
+    overlap_score_scale = torch.as_tensor(
+        np.abs(
+            normalizer.unnormalize(np.ones((1, obs_dim), dtype=np.float32))
+            - normalizer.unnormalize(np.zeros((1, obs_dim), dtype=np.float32))
+        ).reshape(-1),
+        device=config.device,
+        dtype=torch.float32,
+    )
 
     task_trajectories = []
     task_stats_collector = defaultdict(list)
     task_renders_list = []
     task_trajectories_3d = []
+    task_segment_trajectories_3d = []
     task_actual_trajectories_3d = []
 
     for i_episode in trange(num_eval_episodes + num_video_episodes, desc=f"Task {task_id} Episodes", leave=False):
@@ -69,6 +98,13 @@ def segment_stitch_evaluate(
         current_plan = None
         current_subgoal = None
         current_subgoal_idx = -1
+        current_subgoal_span = 0
+        current_subgoal_reached = False
+        current_finished_horizon = 0
+        temp_plan_valid_horizon = min(
+            horizon,
+            _segment_chain_horizon(initial_num_segments, segment_horizon, overlap_steps),
+        )
         jump_steps = config.task.get("jump_steps", 1)
         plan_lookahead = max(1, config.task.low_horizon // jump_steps)
 
@@ -91,12 +127,30 @@ def segment_stitch_evaluate(
                 need_replan = True
             elif mode == "plan_every_step":
                 need_replan = True
-            elif mode == "achieve_subgoal" and current_subgoal is not None:
+            elif (
+                mode == "achieve_subgoal"
+                and config.get("adaptive_replan_on_error", False)
+                and current_subgoal is not None
+            ):
                 subgoal_error = np.linalg.norm((obs[:obs_dim] - current_subgoal)[goal_indices])
                 if subgoal_error > config.task.get("replan_error_threshold", 3.0):
                     need_replan = True
 
             if need_replan:
+                if config.get("adaptive_replan_horizon", False):
+                    num_segments = _resolve_adaptive_num_segments(
+                        initial_num_segments=initial_num_segments,
+                        completed_horizon=current_finished_horizon,
+                        segment_horizon=segment_horizon,
+                        overlap_steps=overlap_steps,
+                    )
+                else:
+                    num_segments = initial_num_segments
+                temp_plan_valid_horizon = min(
+                    horizon,
+                    _segment_chain_horizon(num_segments, segment_horizon, overlap_steps),
+                )
+
                 start_state = torch.as_tensor(
                     normalized_obs,
                     device=config.device,
@@ -127,18 +181,26 @@ def segment_stitch_evaluate(
                     temperature=float(config.task.planner_temperature),
                     condition_cg=condition_cg,
                     w_cg=w_cg,
+                    overlap_score_scale=overlap_score_scale,
                 )
 
                 segment_list_np = [
                     normalizer.unnormalize(segment.detach().cpu().numpy()) for segment in segment_list
                 ]
-                candidate_order, candidate_scores = diffusions_model.rank_overlap_mismatch(
-                    segment_list_np,
-                    overlap_steps=overlap_steps,
-                )
-
-                top_n = max(1, min(int(stitch_cfg.top_n), candidate_order.shape[0]))
-                chosen_pool = candidate_order[:top_n]
+                candidate_scores = sample_log.get("candidate_scores", None)
+                score_kind = str(sample_log.get("score_kind", "")).lower()
+                if candidate_scores is not None:
+                    candidate_scores = np.asarray(candidate_scores, dtype=np.float32).reshape(-1)
+                    top_n = max(1, min(int(stitch_cfg.top_n), candidate_scores.shape[0]))
+                    chosen_pool = np.arange(top_n, dtype=np.int64)
+                else: # overlap mismatch score for default
+                    candidate_order, candidate_scores = diffusions_model.rank_overlap_mismatch(
+                        segment_list_np,
+                        overlap_steps=overlap_steps,
+                    )
+                    top_n = max(1, min(int(stitch_cfg.top_n), candidate_order.shape[0]))
+                    chosen_pool = candidate_order[:top_n]
+                    score_kind = "overlap_mismatch"
 
                 top_segments = [segment[chosen_pool] for segment in segment_list_np]
                 stitched_candidates = diffusions_model.blend_segments(
@@ -146,7 +208,7 @@ def segment_stitch_evaluate(
                     overlap_steps=overlap_steps,
                     blend_mode=str(stitch_cfg.merge_mode),
                     blend_beta=float(stitch_cfg.merge_beta),
-                    target_horizon=horizon,
+                    target_horizon=temp_plan_valid_horizon,
                 )
 
                 if stitch_cfg.pick_mode == "first":
@@ -158,29 +220,59 @@ def segment_stitch_evaluate(
 
                 selected_score = float(candidate_scores[chosen_pool[chosen_idx]])
                 current_plan = stitched_candidates[chosen_idx]
-                current_subgoal_idx = min(plan_lookahead, current_plan.shape[0] - 1)
+                temp_plan_valid_horizon = int(current_plan.shape[0])
+                current_subgoal_idx = min(plan_lookahead, temp_plan_valid_horizon - 1)
+                current_subgoal_span = max(1, current_subgoal_idx)
                 current_subgoal = current_plan[current_subgoal_idx]
+                current_subgoal_reached = False
 
                 if current_episode_step == 0 and is_video_episode:
                     obj_count = object_num.get(config.task.env_name, 1)
+                    selected_segments = np.stack(
+                        [segment[chosen_pool[chosen_idx]] for segment in segment_list_np],
+                        axis=0,
+                    )
+                    segment_xyz = np.zeros(
+                        (selected_segments.shape[0], obj_count, selected_segments.shape[1], 3),
+                        dtype=np.float32,
+                    )
                     plan_xyz = np.zeros((obj_count, current_plan.shape[0], 3), dtype=np.float32)
                     for obj_idx in range(obj_count):
                         plan_xyz[obj_idx] = np.asarray(current_plan[:, -9 * obj_idx - 9 : -9 * obj_idx - 6], dtype=np.float32)
                         plan_xyz[obj_idx, -1, :] = task_goal_state[:obs_dim][-9 * obj_idx - 9 : -9 * obj_idx - 6]
+                        segment_xyz[:, obj_idx] = np.asarray(
+                            selected_segments[:, :, -9 * obj_idx - 9 : -9 * obj_idx - 6],
+                            dtype=np.float32,
+                        )
+                        segment_xyz[-1, obj_idx, -1, :] = task_goal_state[:obs_dim][-9 * obj_idx - 9 : -9 * obj_idx - 6]
                     task_trajectories_3d.append(plan_xyz)
+                    task_segment_trajectories_3d.append(segment_xyz)
 
-                task_stats_collector["selected_overlap_score"].append(selected_score)
+                if score_kind == "overlap_mismatch":
+                    task_stats_collector["selected_overlap_score"].append(selected_score)
 
                 gsc_scores = sample_log.get("gsc_scores", None)
                 if gsc_scores is not None:
-                    per_segment = np.asarray([float(scores[chosen_pool[chosen_idx]]) for scores in gsc_scores], dtype=np.float32)
+                    per_segment = np.asarray(
+                        [float(scores[chosen_pool[chosen_idx]]) for scores in gsc_scores],
+                        dtype=np.float32,
+                    )
                     task_stats_collector["selected_gsc_score"].append(float(per_segment.mean()))
+                elif score_kind == "gsc":
+                    task_stats_collector["selected_gsc_score"].append(selected_score)
 
             elif mode == "achieve_subgoal":
                 distance_to_subgoal = np.linalg.norm((obs[:obs_dim] - current_subgoal)[goal_indices])
-                if distance_to_subgoal <= config.task.goal_tol:
-                    current_subgoal_idx = min(current_subgoal_idx + plan_lookahead, current_plan.shape[0] - 1)
-                    current_subgoal = current_plan[current_subgoal_idx]
+                if distance_to_subgoal <= config.task.goal_tol and not current_subgoal_reached:
+                    current_subgoal_reached = True
+                    if config.get("adaptive_replan_horizon", False):
+                        current_finished_horizon = min(current_finished_horizon + current_subgoal_span, horizon)
+                    if current_subgoal_idx != temp_plan_valid_horizon - 1:
+                        next_subgoal_idx = min(current_subgoal_idx + plan_lookahead, temp_plan_valid_horizon - 1)
+                        current_subgoal_span = max(1, next_subgoal_idx - current_subgoal_idx)
+                        current_subgoal_idx = next_subgoal_idx
+                        current_subgoal = current_plan[current_subgoal_idx]
+                        current_subgoal_reached = False
 
             if config.use_diffusion_invdyn:
                 policy_prior = torch.zeros((1, act_dim), device=config.device)
@@ -256,4 +348,11 @@ def segment_stitch_evaluate(
                 )
 
     eval_info = {key: float(np.mean(value)) for key, value in task_stats_collector.items() if len(value) > 0}
-    return eval_info, task_trajectories, task_renders_list, task_trajectories_3d, task_actual_trajectories_3d
+    return (
+        eval_info,
+        task_trajectories,
+        task_renders_list,
+        task_trajectories_3d,
+        task_segment_trajectories_3d,
+        task_actual_trajectories_3d,
+    )

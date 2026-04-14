@@ -5,8 +5,8 @@ planner_horizon: 161
 planner_temperature: 1.0
 w_ldg: 0
 
-jump_steps: 10
-low_horizon: 20
+jump_steps: 1
+low_horizon: 10
 goal_dim: [19, 20, 21, 28, 29, 30] # None：用全部维度，int：取末尾 N 维（兼容），list/tuple：按显式索引
 goal_tol: 0.6
 replan_every: 200

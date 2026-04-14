@@ -203,11 +203,16 @@ def visualize_3d_trajectories_wandb(
     planned_segment_traj: Optional[np.ndarray] = None,
     actual_traj: Optional[np.ndarray] = None,
     n_cols: Optional[int] = None,
-    figsize_per_plot: float = 4.0,
+    figsize_per_plot: float = 5.0,
 ) -> wandb.Image:
     """
     可视化 3D 轨迹，并打包成单张网格图，返回 wandb.Image 方便日志记录。
-    规划轨迹使用虚线，实际轨迹使用实线。
+    规划轨迹始终使用 blend 后的 planned_traj，并用虚线绘制。
+    实际轨迹使用较浅的实线。marker 语义固定为：
+    - 实际起点: 圆形
+    - 规划终点: X
+    - 实际终点: 方块
+    不同 object 使用不同颜色。
 
     参数:
         planned_traj: numpy.ndarray, shape [B, object_num, T_plan, 3]
@@ -237,70 +242,227 @@ def visualize_3d_trajectories_wandb(
         assert actual_traj.shape[0] == planned_traj.shape[0] and actual_traj.shape[1] == planned_traj.shape[1], \
             "planned_traj 与 actual_traj 的 B/object_num 维度必须一致"
 
-    actual_colors = ['tab:cyan', 'tab:brown', 'tab:olive', 'tab:pink']
     segment_cmap = get_cmap("tab10")
+    object_cmap = get_cmap("Dark2")
 
     B, object_num, _, _ = planned_traj.shape
+    use_segment_coloring = planned_segment_traj is not None and planned_segment_traj.shape[1] > 0
 
     if n_cols is None:
         n_cols = int(math.ceil(math.sqrt(B)))
     n_rows = int(math.ceil(B / n_cols))
 
     fig = plt.figure(figsize=(figsize_per_plot * n_cols, figsize_per_plot * n_rows))
-    legend_handles = []
+    legend_handles = {}
+
+    def register_legend(handle: Line2D):
+        legend_handles.setdefault(handle.get_label(), handle)
+
+    def get_object_color(obj_idx: int):
+        return object_cmap(obj_idx % object_cmap.N)
+
+    def lighten_color(color, blend=0.6):
+        rgb = np.asarray(color[:3], dtype=np.float32)
+        return tuple((1.0 - blend) * rgb + blend * np.ones(3, dtype=np.float32))
+
+    def draw_marker(ax, point, marker, color, size):
+        ax.scatter(
+            point[0],
+            point[1],
+            point[2],
+            marker=marker,
+            s=size,
+            c=[color],
+            edgecolors='black',
+            linewidths=0.7,
+            depthshade=False,
+            zorder=4,
+        )
+
+    register_legend(
+        Line2D(
+            [0], [0],
+            linestyle='None',
+            marker='o',
+            markersize=7.5,
+            markerfacecolor='0.45',
+            markeredgecolor='black',
+            label="Actual Start",
+        )
+    )
+    register_legend(
+        Line2D(
+            [0], [0],
+            linestyle='None',
+            marker='X',
+            markersize=8.5,
+            markerfacecolor='0.45',
+            markeredgecolor='0.45',
+            label="Planned Goal",
+        )
+    )
+    register_legend(
+        Line2D(
+            [0], [0],
+            linestyle='None',
+            marker='s',
+            markersize=7.5,
+            markerfacecolor='0.45',
+            markeredgecolor='black',
+            label="Actual End",
+        )
+    )
+    if not use_segment_coloring:
+        for o in range(object_num):
+            obj_color = get_object_color(o)
+            register_legend(
+                Line2D(
+                    [0], [0],
+                    linestyle='None',
+                    marker='o',
+                    markersize=8,
+                    markerfacecolor=obj_color,
+                    markeredgecolor='black',
+                    label=f"Object {o + 1}",
+                )
+            )
+    if actual_traj is not None:
+        register_legend(
+            Line2D([0], [0], color='0.65', linestyle='-', linewidth=1.8, label="Actual Trajectory")
+        )
+    if use_segment_coloring:
+        n_segments = int(planned_segment_traj.shape[1])
+        for s in range(n_segments):
+            seg_color = segment_cmap(s % segment_cmap.N)
+            register_legend(
+                Line2D([0], [0], color=seg_color, linestyle='--', linewidth=2.1, label=f"Segment {s + 1}")
+            )
+
     for b in range(B):
         ax = fig.add_subplot(n_rows, n_cols, b + 1, projection="3d")
         ax.set_title(f"Sample {b}", fontsize=8)
 
         all_xyz = [planned_traj[b].reshape(-1, 3)]
+        if planned_segment_traj is not None:
+            all_xyz.append(planned_segment_traj[b].reshape(-1, 3))
         if actual_traj is not None:
             all_xyz.append(actual_traj[b].reshape(-1, 3))
         all_xyz = np.concatenate(all_xyz, axis=0)
-
-        if planned_segment_traj is not None and planned_segment_traj.shape[1] > 0:
-            n_segments = planned_segment_traj.shape[1]
-            for s in range(n_segments):
-                seg_color = segment_cmap(s % 10)
-                for o in range(object_num):
-                    seg_o = planned_segment_traj[b, s, o]
-                    ax.plot(seg_o[:, 0], seg_o[:, 1], seg_o[:, 2], linestyle='--', linewidth=2.0, color=seg_color, alpha=0.9)
-                seg_ref = planned_segment_traj[b, s, 0]
-                ax.scatter(seg_ref[0, 0], seg_ref[0, 1], seg_ref[0, 2], marker='o', s=16, color=seg_color)
-                ax.scatter(seg_ref[-1, 0], seg_ref[-1, 1], seg_ref[-1, 2], marker='x', s=24, color=seg_color)
-
-                if b == 0:
-                    legend_handles.append(
-                        Line2D([0], [0], color=seg_color, linestyle='--', linewidth=2.0, label=f"Planned Segment {s + 1}")
-                    )
-        else:
-            for o in range(object_num):
-                plan_color = segment_cmap(o % 10)
-                plan_o = planned_traj[b, o]
-                ax.plot(plan_o[:, 0], plan_o[:, 1], plan_o[:, 2], linestyle='--', linewidth=1.8, color=plan_color)
-                ax.scatter(plan_o[0, 0], plan_o[0, 1], plan_o[0, 2], marker='o', s=18, color=plan_color)
-                ax.scatter(plan_o[-1, 0], plan_o[-1, 1], plan_o[-1, 2], marker='x', s=30, color=plan_color)
-
-                if b == 0:
-                    legend_handles.append(
-                        Line2D([0], [0], color=plan_color, linestyle='--', linewidth=1.8, label=f"Object {o + 1} Planned")
-                    )
+        finite_mask = np.isfinite(all_xyz).all(axis=1)
+        all_xyz = all_xyz[finite_mask] if finite_mask.any() else np.zeros((1, 3), dtype=np.float32)
 
         if actual_traj is not None:
             for o in range(object_num):
-                real_color = 'black' if planned_segment_traj is not None else actual_colors[o % len(actual_colors)]
+                obj_color = get_object_color(o)
+                real_color = lighten_color(obj_color, blend=0.58)
                 real_o = actual_traj[b, o]
-                ax.plot(real_o[:, 0], real_o[:, 1], real_o[:, 2], linestyle='-', linewidth=2.2, color=real_color)
-                ax.scatter(real_o[0, 0], real_o[0, 1], real_o[0, 2], marker='^', s=18, color=real_color)
-                ax.scatter(real_o[-1, 0], real_o[-1, 1], real_o[-1, 2], marker='s', s=18, color=real_color)
-                if b == 0 and planned_segment_traj is None:
-                    legend_handles.append(
-                        Line2D([0], [0], color=real_color, linestyle='-', linewidth=2.2, label=f"Object {o + 1} Actual")
-                    )
-
-            if b == 0 and planned_segment_traj is not None:
-                legend_handles.append(
-                    Line2D([0], [0], color='black', linestyle='-', linewidth=2.2, label="Actual Trajectory")
+                real_mask = np.isfinite(real_o).all(axis=1)
+                real_o = real_o[real_mask]
+                if real_o.shape[0] == 0:
+                    continue
+                ax.plot(
+                    real_o[:, 0],
+                    real_o[:, 1],
+                    real_o[:, 2],
+                    linestyle='-',
+                    linewidth=1.9,
+                    color=real_color,
+                    alpha=0.9,
+                    zorder=1,
                 )
+
+        if use_segment_coloring:
+            n_segments = int(planned_segment_traj.shape[1])
+            seg_horizon = int(planned_segment_traj.shape[3])
+            plan_horizon = int(planned_traj.shape[2])
+            if n_segments <= 1:
+                segment_stride = seg_horizon
+            else:
+                segment_stride = max(1, int(round((plan_horizon - seg_horizon) / float(n_segments - 1))))
+
+            for s in range(n_segments):
+                seg_color = segment_cmap(s % segment_cmap.N)
+                seg_start = s * segment_stride
+                seg_end = min(seg_start + seg_horizon, plan_horizon)
+                if seg_start >= seg_end:
+                    continue
+
+                for o in range(object_num):
+                    plan_o = planned_traj[b, o]
+                    seg_o = plan_o[seg_start:seg_end]
+                    seg_mask = np.isfinite(seg_o).all(axis=1)
+                    seg_o = seg_o[seg_mask]
+                    if seg_o.shape[0] == 0:
+                        continue
+                    ax.plot(
+                        seg_o[:, 0],
+                        seg_o[:, 1],
+                        seg_o[:, 2],
+                        linestyle='--',
+                        linewidth=2.1,
+                        color=seg_color,
+                        alpha=0.95,
+                        zorder=2,
+                    )
+                    ax.scatter(
+                        seg_o[:, 0],
+                        seg_o[:, 1],
+                        seg_o[:, 2],
+                        s=10,
+                        c=[seg_color],
+                        alpha=0.5,
+                        depthshade=False,
+                        zorder=3,
+                    )
+        else:
+            for o in range(object_num):
+                plan_color = get_object_color(o)
+                plan_o = planned_traj[b, o]
+                plan_mask = np.isfinite(plan_o).all(axis=1)
+                plan_o = plan_o[plan_mask]
+                if plan_o.shape[0] == 0:
+                    continue
+                ax.plot(
+                    plan_o[:, 0],
+                    plan_o[:, 1],
+                    plan_o[:, 2],
+                    linestyle='--',
+                    linewidth=2.1,
+                    color=plan_color,
+                    alpha=0.95,
+                    zorder=2,
+                )
+                ax.scatter(
+                    plan_o[:, 0],
+                    plan_o[:, 1],
+                    plan_o[:, 2],
+                    s=10,
+                    c=[plan_color],
+                    alpha=0.5,
+                    depthshade=False,
+                    zorder=3,
+                )
+
+                register_legend(
+                    Line2D([0], [0], color=plan_color, linestyle='--', linewidth=2.1, label=f"Object {o + 1} Planned")
+                )
+
+        for o in range(object_num):
+            obj_color = get_object_color(o)
+
+            plan_o = planned_traj[b, o]
+            plan_mask = np.isfinite(plan_o).all(axis=1)
+            plan_o = plan_o[plan_mask]
+            if plan_o.shape[0] > 0:
+                draw_marker(ax, plan_o[-1], 'X', obj_color, 80)
+
+            if actual_traj is not None:
+                real_o = actual_traj[b, o]
+                real_mask = np.isfinite(real_o).all(axis=1)
+                real_o = real_o[real_mask]
+                if real_o.shape[0] > 0:
+                    draw_marker(ax, real_o[0], 'o', obj_color, 58)
+                    draw_marker(ax, real_o[-1], 's', obj_color, 62)
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -319,8 +481,9 @@ def visualize_3d_trajectories_wandb(
         ax.set_zlim(z_center - half, z_center + half)
 
     if legend_handles:
-        fig.legend(handles=legend_handles, loc='upper center', ncol=max(1, min(len(legend_handles), 4)), fontsize=8)
-        plt.tight_layout(rect=(0, 0, 1, 0.92))
+        handles = list(legend_handles.values())
+        fig.legend(handles=handles, loc='upper center', ncol=max(1, min(len(handles), 5)), fontsize=8.5)
+        plt.tight_layout(rect=(0, 0, 1, 0.88))
     else:
         plt.tight_layout()
 

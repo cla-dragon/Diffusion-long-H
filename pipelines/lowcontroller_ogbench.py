@@ -50,7 +50,8 @@ def train_low_controller_if_needed(
     **_unused_kwargs,
 ):
     alias = _lowctrl_alias(args)
-    default_ckpt_path = os.path.join(lowctrl_save_path, f"{alias}_lowctrl_ckpt_latest.pt")
+    lowctrl_type = "diffusion_invdyn" if use_diffusion_invdyn else "gciql"
+    default_ckpt_path = os.path.join(lowctrl_save_path, f"{lowctrl_type}_{alias}_lowctrl_ckpt_latest.pt")
     load_existing_alias = bool(
         _cfg_get(args, "lowctrl_load_existing_alias", _cfg_get(args, "lowctrl_load_existing", False))
     )
@@ -144,7 +145,7 @@ def train_low_controller_if_needed(
                 }
 
         if n_gradient_step % save_interval == 0:
-            low_controller.save(os.path.join(lowctrl_save_path, f"{alias}_lowctrl_ckpt_{n_gradient_step}.pt"))
+            low_controller.save(os.path.join(lowctrl_save_path, f"{lowctrl_type}_{alias}_lowctrl_ckpt_{n_gradient_step}.pt"))
             low_controller.save(default_ckpt_path)
 
         if n_gradient_step >= target_steps:

@@ -290,6 +290,14 @@ def sample_trajectory(
         device=planner.device,
         dtype=torch.float32,
     ).repeat(num_candidates, 1)
+    overlap_score_scale = torch.as_tensor(
+        np.abs(
+            normalizer.unnormalize(np.ones((1, start_obs.shape[0]), dtype=np.float32))
+            - normalizer.unnormalize(np.zeros((1, start_obs.shape[0]), dtype=np.float32))
+        ).reshape(-1),
+        device=planner.device,
+        dtype=torch.float32,
+    )
 
     segment_list, sample_log = planner.sample_segment_chain(
         start_state=start_state,
@@ -303,12 +311,19 @@ def sample_trajectory(
         temperature=temperature,
         condition_cg=None,
         w_cg=0.0,
+        overlap_score_scale=overlap_score_scale,
     )
 
     segment_list_np = [normalizer.unnormalize(segment.detach().cpu().numpy()) for segment in segment_list]
-    order, scores = planner.rank_overlap_mismatch(segment_list_np, overlap_steps=planner.overlap_steps)
-    top_n = max(1, min(top_n, order.shape[0]))
-    top_idx = order[:top_n]
+    scores = sample_log.get("candidate_scores", None)
+    if scores is not None:
+        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        top_n = max(1, min(top_n, scores.shape[0]))
+        top_idx = np.arange(top_n, dtype=np.int64)
+    else:
+        order, scores = planner.rank_overlap_mismatch(segment_list_np, overlap_steps=planner.overlap_steps)
+        top_n = max(1, min(top_n, order.shape[0]))
+        top_idx = order[:top_n]
     stitched = planner.blend_segments(
         [segment[top_idx] for segment in segment_list_np],
         overlap_steps=planner.overlap_steps,
